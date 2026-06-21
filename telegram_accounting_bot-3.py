@@ -43,6 +43,7 @@ LOGO_PATH = "logo.png"
 # States for conversation
 WAITING_QUICK_SALE = 1
 WAITING_LABEL_INFO = 2
+WAITING_ORDER_ADDRESS = 3
 
 # ===== فونت فارسی برای PDF =====
 FONT_NAME = "Vazir"
@@ -198,6 +199,11 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await process_edit_value(update, context)
         return ConversationHandler.END
 
+    # اگه منتظر آدرس سفارش (فلوی سریع فروش+آدرس) هستیم
+    if context.user_data.get('awaiting_order_address'):
+        await process_order_address(update, context)
+        return ConversationHandler.END
+
     if text == "➕ ثبت فروش":
         await update.message.reply_text(
             "📦 فروش رو این‌جوری بفرست:\n"
@@ -230,20 +236,11 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     elif text == "🏷 ساخت فاکتور پستی":
         await update.message.reply_text(
-            "🏷 برای ساخت فاکتور پستی، اطلاعات رو این‌جوری بفرست (هر کدوم تو یه خط):\n\n"
-            "نام مشتری\n"
-            "آدرس کامل\n"
-            "شماره تماس\n"
-            "کد پستی\n"
-            "محصولات (نام × تعداد، با کاما جدا کن)\n\n"
-            "مثال:\n"
-            "علی محمدی\n"
-            "تهران، خیابان ولیعصر، پلاک ۱۰\n"
-            "09121234567\n"
-            "1234567890\n"
-            "دستمال مرطوب×۲, کرم دست×۱\n\n"
+            "🏷 مشخصات گیرنده رو بفرست (هر چی هست، همونجوری پیست کن - نام، آدرس، تلفن، کدپستی):\n\n"
+            "بعدش محصولات و روش ارسال رو می‌پرسم.\n\n"
             "(برای لغو /cancel رو بزن)"
         )
+        context.user_data['standalone_label'] = True
         return WAITING_LABEL_INFO
 
     else:
@@ -253,14 +250,22 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             product, qty, amount = parsed
             sale_id = add_sale(product, amount, qty, user_id)
             total = amount * qty
+            context.user_data['last_order'] = {
+                'sale_id': sale_id, 'product': product, 'qty': qty, 'amount': amount
+            }
+            keyboard = [[
+                InlineKeyboardButton("🏷 بله، آدرس رو می‌فرستم", callback_data="addaddr_yes"),
+                InlineKeyboardButton("❌ نه، فقط ثبت فروش", callback_data="addaddr_no"),
+            ]]
             await update.message.reply_text(
                 f"✅ فروش ثبت شد!\n\n"
                 f"📦 محصول: {product}\n"
                 f"💵 قیمت واحد: {amount:,.0f} تومان\n"
                 f"🔢 تعداد: {qty}\n"
                 f"💰 جمع کل: {total:,.0f} تومان\n"
-                f"🕐 زمان: {datetime.now().strftime('%H:%M - %Y/%m/%d')}",
-                reply_markup=main_keyboard()
+                f"🕐 زمان: {datetime.now().strftime('%H:%M - %Y/%m/%d')}\n\n"
+                f"📮 می‌خوای فاکتور پستی هم براش بسازم؟",
+                reply_markup=InlineKeyboardMarkup(keyboard)
             )
 
     return ConversationHandler.END
@@ -279,16 +284,24 @@ async def get_quick_sale(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return WAITING_QUICK_SALE
 
     product, qty, amount = parsed
-    add_sale(product, amount, qty, user_id)
+    sale_id = add_sale(product, amount, qty, user_id)
     total = amount * qty
+    context.user_data['last_order'] = {
+        'sale_id': sale_id, 'product': product, 'qty': qty, 'amount': amount
+    }
+    keyboard = [[
+        InlineKeyboardButton("🏷 بله، آدرس رو می‌فرستم", callback_data="addaddr_yes"),
+        InlineKeyboardButton("❌ نه، فقط ثبت فروش", callback_data="addaddr_no"),
+    ]]
     await update.message.reply_text(
         f"✅ فروش ثبت شد!\n\n"
         f"📦 محصول: {product}\n"
         f"💵 قیمت واحد: {amount:,.0f} تومان\n"
         f"🔢 تعداد: {qty}\n"
         f"💰 جمع کل: {total:,.0f} تومان\n"
-        f"🕐 زمان: {datetime.now().strftime('%H:%M - %Y/%m/%d')}",
-        reply_markup=main_keyboard()
+        f"🕐 زمان: {datetime.now().strftime('%H:%M - %Y/%m/%d')}\n\n"
+        f"📮 می‌خوای فاکتور پستی هم براش بسازم؟",
+        reply_markup=InlineKeyboardMarkup(keyboard)
     )
     return ConversationHandler.END
 
@@ -327,6 +340,47 @@ async def handle_delete_callback(update: Update, context: ContextTypes.DEFAULT_T
     query = update.callback_query
     await query.answer()
     user_id = update.effective_user.id
+
+    if query.data == "addaddr_yes":
+        await query.edit_message_text(
+            "📮 مشخصات گیرنده رو بفرست (هر چی هست، همونجوری پیست کن):\n\n"
+            "(برای لغو /cancel رو بزن)"
+        )
+        context.user_data['awaiting_order_address'] = True
+        return
+
+    elif query.data == "addaddr_no":
+        await query.edit_message_text("✅ باشه، فقط فروش ثبت موند.")
+        context.user_data.pop('last_order', None)
+        return
+
+    elif query.data.startswith("shipvia_"):
+        method = query.data.split("_")[1]
+        method_names = {"tipax": "تیپاکس", "post": "پست", "chapar": "چاپار"}
+        method_fa = method_names.get(method, method)
+        order = context.user_data.get('pending_label_order')
+
+        if not order:
+            await query.edit_message_text("❌ اطلاعات سفارش پیدا نشد، دوباره امتحان کن.")
+            return
+
+        try:
+            pdf_path = create_shipping_label(
+                order['recipient_info'], order['products_line'], method_fa
+            )
+            with open(pdf_path, "rb") as f:
+                await context.bot.send_document(
+                    chat_id=update.effective_chat.id,
+                    document=f,
+                    filename="فاکتور_پستی.pdf",
+                    caption=f"🏷 فاکتور پستی ({method_fa}) ساخته شد ✅"
+                )
+            await query.edit_message_text(f"✅ روش ارسال: {method_fa} - فاکتور ارسال شد.")
+        except Exception as e:
+            await query.edit_message_text(f"❌ خطا در ساخت فاکتور: {e}")
+
+        context.user_data.pop('pending_label_order', None)
+        return
 
     if query.data.startswith("del_"):
         sale_id = int(query.data.split("_")[1])
@@ -434,6 +488,34 @@ async def process_edit_value(update: Update, context: ContextTypes.DEFAULT_TYPE)
         )
 
     context.user_data.clear()
+
+async def process_order_address(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    address_text = update.message.text.strip()
+    order = context.user_data.get('last_order')
+
+    if not order:
+        await update.message.reply_text("❌ سفارشی پیدا نشد، دوباره از ثبت فروش شروع کن.", reply_markup=main_keyboard())
+        context.user_data.clear()
+        return
+
+    # کل متن پیست‌شده عیناً به‌عنوان «مشخصات گیرنده» استفاده می‌شه، بدون پردازش یا تفکیک
+    products_line = f"{order['product']}×{order['qty']}"
+    context.user_data['pending_label_order'] = {
+        'recipient_info': address_text,
+        'products_line': products_line,
+    }
+    context.user_data.pop('awaiting_order_address', None)
+    context.user_data.pop('last_order', None)
+
+    keyboard = [[
+        InlineKeyboardButton("📦 تیپاکس", callback_data="shipvia_tipax"),
+        InlineKeyboardButton("📮 پست", callback_data="shipvia_post"),
+        InlineKeyboardButton("🚚 چاپار", callback_data="shipvia_chapar"),
+    ]]
+    await update.message.reply_text(
+        "🚚 روش ارسال چیه؟",
+        reply_markup=InlineKeyboardMarkup(keyboard)
+    )
 
 # ===== گزارش‌ها =====
 def format_number(n):
@@ -648,38 +730,40 @@ async def send_excel_export(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def get_label_info(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = update.message.text
-    lines = [l.strip() for l in text.split("\n") if l.strip()]
+    text = update.message.text.strip()
 
-    if len(lines) < 5:
+    if context.user_data.get('standalone_label'):
+        # مرحله ۱: مشخصات گیرنده دریافت شد، حالا محصولات رو بپرس
+        context.user_data['standalone_recipient'] = text
+        context.user_data.pop('standalone_label', None)
+        context.user_data['standalone_awaiting_products'] = True
         await update.message.reply_text(
-            "❌ اطلاعات کامل نیست. باید ۵ خط داشته باشه:\n"
-            "نام مشتری / آدرس / تلفن / کدپستی / محصولات\n\n"
-            "دوباره امتحان کن یا /cancel رو بزن."
+            "📦 حالا محصولات سفارش رو بفرست (مثال: تراول ماگ×۱, دستمال مرطوب×۲):"
         )
         return WAITING_LABEL_INFO
 
-    customer_name = lines[0]
-    address = lines[1]
-    phone = lines[2]
-    postal_code = lines[3]
-    products_line = lines[4]
+    if context.user_data.get('standalone_awaiting_products'):
+        products_line = text
+        recipient_info = context.user_data.pop('standalone_recipient', "")
+        context.user_data.pop('standalone_awaiting_products', None)
+        context.user_data['pending_label_order'] = {
+            'recipient_info': recipient_info,
+            'products_line': products_line,
+        }
+        keyboard = [[
+            InlineKeyboardButton("📦 تیپاکس", callback_data="shipvia_tipax"),
+            InlineKeyboardButton("📮 پست", callback_data="shipvia_post"),
+            InlineKeyboardButton("🚚 چاپار", callback_data="shipvia_chapar"),
+        ]]
+        await update.message.reply_text(
+            "🚚 روش ارسال چیه؟",
+            reply_markup=InlineKeyboardMarkup(keyboard)
+        )
+        return ConversationHandler.END
 
-    try:
-        pdf_path = create_shipping_label(customer_name, address, phone, postal_code, products_line)
-        with open(pdf_path, "rb") as f:
-            await update.message.reply_document(
-                document=f,
-                filename=f"label_{customer_name}.pdf",
-                caption=f"🏷 فاکتور پستی برای {customer_name} ساخته شد ✅"
-            )
-    except Exception as e:
-        await update.message.reply_text(f"❌ خطا در ساخت فاکتور: {e}")
-
-    await update.message.reply_text("منوی اصلی:", reply_markup=main_keyboard())
     return ConversationHandler.END
 
-def create_shipping_label(customer_name, address, phone, postal_code, products_line):
+def create_shipping_label(recipient_info, products_line, shipping_method=""):
     register_persian_font()
     use_font = FONT_NAME if FONT_REGISTERED else "Helvetica"
 
@@ -712,18 +796,18 @@ def create_shipping_label(customer_name, address, phone, postal_code, products_l
         return lines
 
     # کادر دور برگه
-    c.setLineWidth(1.5)
-    c.rect(5*mm, 5*mm, width - 10*mm, height - 10*mm)
+    c.setLineWidth(1.2)
+    c.rect(4*mm, 4*mm, width - 8*mm, height - 8*mm)
 
     # لوگوی فروشگاه - گوشه سمت راست بالا
-    logo_size = 20 * mm
+    logo_size = 16 * mm
     if os.path.exists(LOGO_PATH):
         try:
             logo = ImageReader(LOGO_PATH)
             c.drawImage(
                 logo,
                 width - margin - logo_size,
-                height - margin - logo_size,
+                height - margin - logo_size + 2*mm,
                 width=logo_size,
                 height=logo_size,
                 preserveAspectRatio=True,
@@ -733,66 +817,58 @@ def create_shipping_label(customer_name, address, phone, postal_code, products_l
             pass
 
     # عنوان (پایین‌تر از لوگو، وسط‌چین)
-    y -= (logo_size + 4*mm)
-    c.setFont(use_font, 16)
+    y -= (logo_size - 2*mm)
+    c.setFont(use_font, 13)
     title_text = fa("فاکتور ارسال مرسوله") if FONT_REGISTERED else "فاکتور ارسال مرسوله"
     c.drawCentredString(width / 2, y, title_text)
-    y -= 9*mm
+    y -= 6*mm
 
     c.setLineWidth(0.5)
     c.line(margin, y, width - margin, y)
-    y -= 9*mm
+    y -= 6*mm
 
     # ===== بخش فرستنده (ثابت) =====
-    draw_rtl_line("فرستنده:", 12, y)
-    y -= 8*mm
-    draw_rtl_line(STORE_NAME, 12, y)
-    y -= 8*mm
-    for line in wrap_text(STORE_ADDRESS, 38):
-        draw_rtl_line(line, 10, y)
-        y -= 6.5*mm
-    draw_rtl_line(f"تلفن: {STORE_PHONE}", 10, y)
-    y -= 8*mm
+    draw_rtl_line("فرستنده:", 10.5, y)
+    y -= 5.5*mm
+    draw_rtl_line(f"{STORE_NAME} | {STORE_PHONE}", 9.5, y)
+    y -= 5*mm
+    for line in wrap_text(STORE_ADDRESS, 42):
+        draw_rtl_line(line, 9, y)
+        y -= 4.8*mm
 
+    y -= 1.5*mm
     c.line(margin, y, width - margin, y)
-    y -= 9*mm
+    y -= 6*mm
 
     # ===== بخش گیرنده (مشتری) =====
-    draw_rtl_line("گیرنده:", 12, y)
-    y -= 8*mm
+    header = "گیرنده:"
+    if shipping_method:
+        header_full = f"گیرنده:        روش ارسال: {shipping_method}"
+        draw_rtl_line(header_full, 10.5, y)
+    else:
+        draw_rtl_line(header, 10.5, y)
+    y -= 6*mm
 
-    draw_rtl_line(customer_name, 13, y)
-    y -= 9*mm
-
-    draw_rtl_line(f"تلفن: {phone}", 12, y)
-    y -= 9*mm
-
-    draw_rtl_line(f"کد پستی: {postal_code}", 12, y)
-    y -= 9*mm
-
-    draw_rtl_line("آدرس:", 12, y)
-    y -= 8*mm
-
-    for line in wrap_text(address, 38):
+    for line in wrap_text(recipient_info, 40):
         draw_rtl_line(line, 11, y)
-        y -= 7*mm
+        y -= 6*mm
 
-    y -= 5*mm
+    y -= 2*mm
     c.line(margin, y, width - margin, y)
-    y -= 8*mm
+    y -= 6*mm
 
     # محصولات سفارش
-    draw_rtl_line("اقلام سفارش:", 12, y)
-    y -= 8*mm
+    draw_rtl_line("اقلام سفارش:", 10.5, y)
+    y -= 6*mm
 
     items = [p.strip() for p in products_line.split(",")]
     for item in items:
-        draw_rtl_line(f"• {item}", 11, y)
-        y -= 7*mm
+        draw_rtl_line(f"• {item}", 10, y)
+        y -= 5.5*mm
 
     # پاورقی
-    c.setFont("Helvetica", 8)
-    c.drawCentredString(width / 2, 10*mm, datetime.now().strftime("%Y-%m-%d %H:%M"))
+    c.setFont("Helvetica", 7)
+    c.drawCentredString(width / 2, 8*mm, datetime.now().strftime("%Y-%m-%d %H:%M"))
 
     c.save()
     return filename
