@@ -5,6 +5,7 @@ Personal Sales Accounting Telegram Bot - v2
 """
 
 import os
+import re
 import sqlite3
 from datetime import datetime, timedelta
 from telegram import (
@@ -85,8 +86,25 @@ def init_db():
             user_id INTEGER NOT NULL
         )
     ''')
+    c.execute('''
+        CREATE TABLE IF NOT EXISTS label_counter (
+            user_id INTEGER PRIMARY KEY,
+            last_number INTEGER NOT NULL DEFAULT 0
+        )
+    ''')
     conn.commit()
     conn.close()
+
+def get_next_label_number(user_id: int) -> int:
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    c.execute("INSERT OR IGNORE INTO label_counter (user_id, last_number) VALUES (?, 0)", (user_id,))
+    c.execute("UPDATE label_counter SET last_number = last_number + 1 WHERE user_id=?", (user_id,))
+    conn.commit()
+    c.execute("SELECT last_number FROM label_counter WHERE user_id=?", (user_id,))
+    number = c.fetchone()[0]
+    conn.close()
+    return number
 
 def add_sale(product: str, amount: float, quantity: int, user_id: int):
     conn = sqlite3.connect(DB_FILE)
@@ -168,16 +186,18 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"سلام {name}! 👋\n\n"
         "به ربات حسابداری فروشت خوش اومدی 📦💰\n\n"
         "⚡️ ثبت سریع: کافیه این‌جوری بنویسی:\n"
-        "نام محصول، تعداد، قیمت واحد\n"
-        "مثال: دستمال مرطوب، ۲، ۱۵۰۰۰۰\n\n"
+        "نام محصول/تعداد/قیمت واحد\n"
+        "مثال: دستمال مرطوب/۲/۱۵۰۰۰۰\n\n"
         "یا از منوی پایین استفاده کن:",
         reply_markup=main_keyboard()
     )
 
 # ===== ثبت سریع فروش با پیام تکی =====
 def try_parse_quick_sale(text: str):
-    """تلاش برای پارس کردن پیام به فرم: نام، تعداد، قیمت"""
-    parts = [p.strip() for p in text.replace("،", ",").split(",")]
+    """تلاش برای پارس کردن پیام به فرم: نام/تعداد/قیمت (یا با کاما)"""
+    # هم / و هم ، و , به‌عنوان جداکننده پذیرفته می‌شه
+    normalized = text.replace("،", "/").replace(",", "/")
+    parts = [p.strip() for p in normalized.split("/")]
     if len(parts) != 3:
         return None
     product, qty_str, amount_str = parts
@@ -204,11 +224,16 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await process_order_address(update, context)
         return ConversationHandler.END
 
+    # اگه منتظر اسم مشتری برای نام‌گذاری فایل هستیم
+    if context.user_data.get('awaiting_customer_name'):
+        await process_customer_name_for_filename(update, context)
+        return ConversationHandler.END
+
     if text == "➕ ثبت فروش":
         await update.message.reply_text(
             "📦 فروش رو این‌جوری بفرست:\n"
-            "نام محصول، تعداد، قیمت واحد\n\n"
-            "مثال:\nدستمال مرطوب، ۲، ۱۵۰۰۰۰\n\n"
+            "نام محصول/تعداد/قیمت واحد\n\n"
+            "مثال:\nدستمال مرطوب/۲/۱۵۰۰۰۰\n\n"
             "(برای لغو /cancel رو بزن)"
         )
         return WAITING_QUICK_SALE
@@ -278,8 +303,8 @@ async def get_quick_sale(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not parsed:
         await update.message.reply_text(
             "❌ فرمت درست نیست. دوباره امتحان کن:\n"
-            "نام محصول، تعداد، قیمت واحد\n"
-            "مثال: دستمال مرطوب، ۲، ۱۵۰۰۰۰"
+            "نام محصول/تعداد/قیمت واحد\n"
+            "مثال: دستمال مرطوب/۲/۱۵۰۰۰۰"
         )
         return WAITING_QUICK_SALE
 
@@ -364,22 +389,36 @@ async def handle_delete_callback(update: Update, context: ContextTypes.DEFAULT_T
             await query.edit_message_text("❌ اطلاعات سفارش پیدا نشد، دوباره امتحان کن.")
             return
 
-        try:
-            pdf_path = create_shipping_label(
-                order['recipient_info'], order['products_line'], method_fa
+        if method == "post":
+            # برای روش پست، اول باید نوع کرایه رو بپرسیم
+            order['shipping_method'] = method_fa
+            context.user_data['pending_label_order'] = order
+            keyboard = [[
+                InlineKeyboardButton("💰 پیش‌کرایه", callback_data="postpay_pre"),
+                InlineKeyboardButton("💵 پس‌کرایه", callback_data="postpay_post"),
+            ]]
+            await query.edit_message_text(
+                "📮 نوع کرایه پست چیه؟",
+                reply_markup=InlineKeyboardMarkup(keyboard)
             )
-            with open(pdf_path, "rb") as f:
-                await context.bot.send_document(
-                    chat_id=update.effective_chat.id,
-                    document=f,
-                    filename="فاکتور_پستی.pdf",
-                    caption=f"🏷 فاکتور پستی ({method_fa}) ساخته شد ✅"
-                )
-            await query.edit_message_text(f"✅ روش ارسال: {method_fa} - فاکتور ارسال شد.")
-        except Exception as e:
-            await query.edit_message_text(f"❌ خطا در ساخت فاکتور: {e}")
+            return
 
-        context.user_data.pop('pending_label_order', None)
+        await finalize_and_send_label(update, context, order, method_fa, user_id)
+        return
+
+    elif query.data.startswith("postpay_"):
+        pay_type = query.data.split("_")[1]
+        pay_names = {"pre": "پیش‌کرایه", "post": "پس‌کرایه"}
+        pay_fa = pay_names.get(pay_type, "")
+        order = context.user_data.get('pending_label_order')
+
+        if not order:
+            await query.edit_message_text("❌ اطلاعات سفارش پیدا نشد، دوباره امتحان کن.")
+            return
+
+        method_fa = f"{order.get('shipping_method', 'پست')} ({pay_fa})"
+        await finalize_and_send_label(update, context, order, method_fa, user_id)
+        return
         return
 
     if query.data.startswith("del_"):
@@ -440,6 +479,31 @@ async def handle_delete_callback(update: Update, context: ContextTypes.DEFAULT_T
         field_names = {"product": "نام محصول", "quantity": "تعداد", "amount": "قیمت واحد"}
         await query.edit_message_text(f"✏️ مقدار جدید برای «{field_names[field]}» رو بفرست:")
         context.user_data['awaiting_edit_value'] = True
+
+async def finalize_and_send_label(update: Update, context: ContextTypes.DEFAULT_TYPE, order: dict, method_fa: str, user_id: int):
+    """ساخت نهایی فاکتور پستی و ارسال آن، با شماره سریال و نام مشتری در اسم فایل"""
+    query = update.callback_query
+    try:
+        pdf_path = create_shipping_label(
+            order['recipient_info'], order['products_line'], method_fa
+        )
+        serial = get_next_label_number(user_id)
+        customer_name = order.get('customer_name', '').strip()
+        safe_name = re.sub(r'[^\w\u0600-\u06FF]+', '_', customer_name).strip('_') if customer_name else "بدون_نام"
+        file_caption_name = f"فاکتور_{serial:03d}_{safe_name}.pdf"
+
+        with open(pdf_path, "rb") as f:
+            await context.bot.send_document(
+                chat_id=update.effective_chat.id,
+                document=f,
+                filename=file_caption_name,
+                caption=f"🏷 فاکتور پستی ({method_fa}) برای {customer_name or 'مشتری'} ساخته شد ✅\n📄 {file_caption_name}"
+            )
+        await query.edit_message_text(f"✅ روش ارسال: {method_fa} - فاکتور ({file_caption_name}) ارسال شد.")
+    except Exception as e:
+        await query.edit_message_text(f"❌ خطا در ساخت فاکتور: {e}")
+
+    context.user_data.pop('pending_label_order', None)
 
 async def process_edit_value(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
@@ -506,6 +570,24 @@ async def process_order_address(update: Update, context: ContextTypes.DEFAULT_TY
     }
     context.user_data.pop('awaiting_order_address', None)
     context.user_data.pop('last_order', None)
+    context.user_data['awaiting_customer_name'] = True
+
+    await update.message.reply_text(
+        "👤 اسم مشتری چی باشه؟ (فقط برای نام‌گذاری فایل، مثلاً: علی محمدی)"
+    )
+
+async def process_customer_name_for_filename(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    customer_name = update.message.text.strip()
+    order = context.user_data.get('pending_label_order')
+
+    if not order:
+        await update.message.reply_text("❌ سفارشی پیدا نشد، دوباره از ثبت فروش شروع کن.", reply_markup=main_keyboard())
+        context.user_data.clear()
+        return
+
+    order['customer_name'] = customer_name
+    context.user_data['pending_label_order'] = order
+    context.user_data.pop('awaiting_customer_name', None)
 
     keyboard = [[
         InlineKeyboardButton("📦 تیپاکس", callback_data="shipvia_tipax"),
@@ -750,14 +832,9 @@ async def get_label_info(update: Update, context: ContextTypes.DEFAULT_TYPE):
             'recipient_info': recipient_info,
             'products_line': products_line,
         }
-        keyboard = [[
-            InlineKeyboardButton("📦 تیپاکس", callback_data="shipvia_tipax"),
-            InlineKeyboardButton("📮 پست", callback_data="shipvia_post"),
-            InlineKeyboardButton("🚚 چاپار", callback_data="shipvia_chapar"),
-        ]]
+        context.user_data['awaiting_customer_name'] = True
         await update.message.reply_text(
-            "🚚 روش ارسال چیه؟",
-            reply_markup=InlineKeyboardMarkup(keyboard)
+            "👤 اسم مشتری چی باشه؟ (فقط برای نام‌گذاری فایل، مثلاً: علی محمدی)"
         )
         return ConversationHandler.END
 
@@ -849,9 +926,13 @@ def create_shipping_label(recipient_info, products_line, shipping_method=""):
         draw_rtl_line(header, 10.5, y)
     y -= 6*mm
 
-    for line in wrap_text(recipient_info, 40):
-        draw_rtl_line(line, 11, y)
-        y -= 6*mm
+    for raw_line in recipient_info.split("\n"):
+        raw_line = raw_line.strip()
+        if not raw_line:
+            continue
+        for line in wrap_text(raw_line, 40):
+            draw_rtl_line(line, 11, y)
+            y -= 6*mm
 
     y -= 2*mm
     c.line(margin, y, width - margin, y)
