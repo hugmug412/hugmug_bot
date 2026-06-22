@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-ربات حسابداری فروش تلگرام - نسخه ۲
-Personal Sales Accounting Telegram Bot - v2
+ربات حسابداری فروش هاگ ماگ - نسخه ۳
+نسخه کامل با چند محصول، توضیحات، وضعیت سفارش
 """
 
 import os
@@ -21,7 +21,6 @@ from reportlab.pdfgen import canvas
 from reportlab.lib.units import mm
 from reportlab.pdfbase import pdfmetrics
 from reportlab.pdfbase.ttfonts import TTFont
-from reportlab.lib.enums import TA_RIGHT
 from reportlab.lib.utils import ImageReader
 import arabic_reshaper
 from bidi.algorithm import get_display
@@ -31,35 +30,40 @@ from openpyxl.styles import Font, Alignment
 # ===== تنظیمات =====
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
 if not BOT_TOKEN:
-    raise ValueError("متغیر محیطی BOT_TOKEN تنظیم نشده! آن را در تنظیمات سرور اضافه کن.")
+    raise ValueError("متغیر محیطی BOT_TOKEN تنظیم نشده!")
 DB_FILE = "sales.db"
-PROFIT_MARGIN = 0.30  # درصد سود تقریبی (۳۰٪)
+PROFIT_MARGIN = 0.30
 
-# اطلاعات ثابت فروشگاه (فرستنده)
+# اطلاعات ثابت فروشگاه
 STORE_NAME = "فروشگاه لوازم کادویی هاگ ماگ"
 STORE_ADDRESS = "خوزستان، اندیمشک، خیابان سینا، جنب آزمایشگاه سینا"
 STORE_PHONE = "09376923487"
 LOGO_PATH = "logo.png"
 
-# States for conversation
-WAITING_QUICK_SALE = 1
-WAITING_LABEL_INFO = 2
-WAITING_ORDER_ADDRESS = 3
+# وضعیت‌های سفارش
+STATUS_NEW      = "🟡 ثبت شده"
+STATUS_READY    = "📦 آماده ارسال"
+STATUS_SENT     = "🚚 ارسال شده"
+ALL_STATUSES    = [STATUS_NEW, STATUS_READY, STATUS_SENT]
 
-# ===== فونت فارسی برای PDF =====
+# States
+WAITING_ITEMS   = 1
+WAITING_NOTE    = 2
+WAITING_LABEL   = 3
+
 FONT_NAME = "Vazir"
 FONT_REGISTERED = False
 
+# ===== فونت فارسی =====
 def register_persian_font():
     global FONT_REGISTERED
     if FONT_REGISTERED:
         return
-    # دانلود فونت فارسی در صورت نبود
     font_path = "Vazirmatn-Regular.ttf"
     if not os.path.exists(font_path):
         import urllib.request
-        url = "https://github.com/rastikerdar/vazirmatn/raw/master/fonts/ttf/Vazirmatn-Regular.ttf"
         try:
+            url = "https://github.com/rastikerdar/vazirmatn/raw/master/fonts/ttf/Vazirmatn-Regular.ttf"
             urllib.request.urlretrieve(url, font_path)
         except Exception:
             pass
@@ -68,24 +72,35 @@ def register_persian_font():
         FONT_REGISTERED = True
 
 def fa(text):
-    """تبدیل متن فارسی برای نمایش درست در PDF (راست‌چین و چسبیده)"""
-    reshaped = arabic_reshaper.reshape(text)
+    reshaped = arabic_reshaper.reshape(str(text))
     return get_display(reshaped)
 
 # ===== دیتابیس =====
 def init_db():
     conn = sqlite3.connect(DB_FILE)
     c = conn.cursor()
+    # جدول سفارشات
     c.execute('''
-        CREATE TABLE IF NOT EXISTS sales (
+        CREATE TABLE IF NOT EXISTS orders (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
-            product TEXT NOT NULL,
-            amount REAL NOT NULL,
-            quantity INTEGER DEFAULT 1,
+            note TEXT DEFAULT "",
+            status TEXT DEFAULT "🟡 ثبت شده",
             date TEXT NOT NULL,
             user_id INTEGER NOT NULL
         )
     ''')
+    # جدول اقلام هر سفارش
+    c.execute('''
+        CREATE TABLE IF NOT EXISTS order_items (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            order_id INTEGER NOT NULL,
+            product TEXT NOT NULL,
+            quantity INTEGER NOT NULL DEFAULT 1,
+            amount REAL NOT NULL,
+            FOREIGN KEY (order_id) REFERENCES orders(id) ON DELETE CASCADE
+        )
+    ''')
+    # جدول شماره فاکتور
     c.execute('''
         CREATE TABLE IF NOT EXISTS label_counter (
             user_id INTEGER PRIMARY KEY,
@@ -94,6 +109,102 @@ def init_db():
     ''')
     conn.commit()
     conn.close()
+
+def create_order(user_id: int, items: list, note: str = "") -> int:
+    """ثبت سفارش جدید با چند آیتم. items = [(product, qty, amount), ...]"""
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    c.execute(
+        "INSERT INTO orders (note, status, date, user_id) VALUES (?, ?, ?, ?)",
+        (note, STATUS_NEW, datetime.now().strftime("%Y-%m-%d %H:%M:%S"), user_id)
+    )
+    order_id = c.lastrowid
+    for product, qty, amount in items:
+        c.execute(
+            "INSERT INTO order_items (order_id, product, quantity, amount) VALUES (?, ?, ?, ?)",
+            (order_id, product, qty, amount)
+        )
+    conn.commit()
+    conn.close()
+    return order_id
+
+def get_order(order_id: int, user_id: int):
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    c.execute("SELECT id, note, status, date FROM orders WHERE id=? AND user_id=?", (order_id, user_id))
+    order = c.fetchone()
+    if not order:
+        conn.close()
+        return None, []
+    c.execute("SELECT id, product, quantity, amount FROM order_items WHERE order_id=?", (order_id,))
+    items = c.fetchall()
+    conn.close()
+    return order, items
+
+def get_orders_in_range(user_id: int, start: str, end: str):
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    c.execute(
+        "SELECT id, note, status, date FROM orders WHERE user_id=? AND date BETWEEN ? AND ? ORDER BY date DESC",
+        (user_id, start, end)
+    )
+    orders = c.fetchall()
+    result = []
+    for o in orders:
+        c.execute("SELECT product, quantity, amount FROM order_items WHERE order_id=?", (o[0],))
+        items = c.fetchall()
+        result.append((o, items))
+    conn.close()
+    return result
+
+def get_status_counts(user_id: int):
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    counts = {}
+    for s in ALL_STATUSES:
+        c.execute("SELECT COUNT(*) FROM orders WHERE user_id=? AND status=?", (user_id, s))
+        counts[s] = c.fetchone()[0]
+    conn.close()
+    return counts
+
+def update_order_status(order_id: int, user_id: int, new_status: str):
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    c.execute("UPDATE orders SET status=? WHERE id=? AND user_id=?", (new_status, order_id, user_id))
+    conn.commit()
+    conn.close()
+
+def update_order_note(order_id: int, user_id: int, note: str):
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    c.execute("UPDATE orders SET note=? WHERE id=? AND user_id=?", (note, order_id, user_id))
+    conn.commit()
+    conn.close()
+
+def delete_order(order_id: int, user_id: int):
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    c.execute("DELETE FROM order_items WHERE order_id=?", (order_id,))
+    c.execute("DELETE FROM orders WHERE id=? AND user_id=?", (order_id, user_id))
+    conn.commit()
+    deleted = c.rowcount > 0
+    conn.close()
+    return deleted
+
+def get_product_summary(user_id: int, start: str, end: str):
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    c.execute(
+        """SELECT oi.product, SUM(oi.amount * oi.quantity), SUM(oi.quantity)
+           FROM order_items oi
+           JOIN orders o ON oi.order_id = o.id
+           WHERE o.user_id=? AND o.date BETWEEN ? AND ?
+           GROUP BY oi.product ORDER BY 2 DESC""",
+        (user_id, start, end)
+    )
+    rows = c.fetchall()
+    conn.close()
+    return rows
 
 def get_next_label_number(user_id: int) -> int:
     conn = sqlite3.connect(DB_FILE)
@@ -106,143 +217,103 @@ def get_next_label_number(user_id: int) -> int:
     conn.close()
     return number
 
-def add_sale(product: str, amount: float, quantity: int, user_id: int):
-    conn = sqlite3.connect(DB_FILE)
-    c = conn.cursor()
-    c.execute(
-        "INSERT INTO sales (product, amount, quantity, date, user_id) VALUES (?, ?, ?, ?, ?)",
-        (product, amount, quantity, datetime.now().strftime("%Y-%m-%d %H:%M:%S"), user_id)
-    )
-    conn.commit()
-    sale_id = c.lastrowid
-    conn.close()
-    return sale_id
-
-def delete_sale(sale_id: int, user_id: int):
-    conn = sqlite3.connect(DB_FILE)
-    c = conn.cursor()
-    c.execute("DELETE FROM sales WHERE id=? AND user_id=?", (sale_id, user_id))
-    conn.commit()
-    deleted = c.rowcount > 0
-    conn.close()
-    return deleted
-
-def get_sale_by_id(sale_id: int, user_id: int):
-    conn = sqlite3.connect(DB_FILE)
-    c = conn.cursor()
-    c.execute("SELECT id, product, amount, quantity, date FROM sales WHERE id=? AND user_id=?", (sale_id, user_id))
-    row = c.fetchone()
-    conn.close()
-    return row
-
-def update_sale(sale_id: int, user_id: int, field: str, value):
-    conn = sqlite3.connect(DB_FILE)
-    c = conn.cursor()
-    c.execute(f"UPDATE sales SET {field}=? WHERE id=? AND user_id=?", (value, sale_id, user_id))
-    conn.commit()
-    updated = c.rowcount > 0
-    conn.close()
-    return updated
-
-def get_sales_in_range(user_id: int, start_date: str, end_date: str):
-    conn = sqlite3.connect(DB_FILE)
-    c = conn.cursor()
-    c.execute(
-        "SELECT id, product, amount, quantity, date FROM sales WHERE user_id=? AND date BETWEEN ? AND ? ORDER BY date DESC",
-        (user_id, start_date, end_date)
-    )
-    rows = c.fetchall()
-    conn.close()
-    return rows
-
-def get_product_summary(user_id: int, start_date: str, end_date: str):
-    conn = sqlite3.connect(DB_FILE)
-    c = conn.cursor()
-    c.execute(
-        """SELECT product, SUM(amount*quantity) as total, SUM(quantity) as qty
-           FROM sales WHERE user_id=? AND date BETWEEN ? AND ?
-           GROUP BY product ORDER BY total DESC""",
-        (user_id, start_date, end_date)
-    )
-    rows = c.fetchall()
-    conn.close()
-    return rows
-
 # ===== کیبورد =====
 def main_keyboard():
     buttons = [
-        [KeyboardButton("➕ ثبت فروش"), KeyboardButton("✏️ ویرایش/حذف فروش")],
+        [KeyboardButton("➕ ثبت فروش"), KeyboardButton("✏️ ویرایش/حذف")],
         [KeyboardButton("💰 امروز"), KeyboardButton("📊 گزارش هفتگی")],
         [KeyboardButton("📈 گزارش ماهانه"), KeyboardButton("🏆 برترین محصولات")],
-        [KeyboardButton("📋 آخرین فروش‌ها"), KeyboardButton("🏷 ساخت فاکتور پستی")],
-        [KeyboardButton("📥 خروجی اکسل ماه")],
+        [KeyboardButton("📋 آخرین سفارشات"), KeyboardButton("🏷 فاکتور پستی")],
+        [KeyboardButton("📥 خروجی اکسل"), KeyboardButton("📦 وضعیت سفارشات")],
     ]
     return ReplyKeyboardMarkup(buttons, resize_keyboard=True)
 
-# ===== هندلر شروع =====
+# ===== پارسر محصولات =====
+def parse_items_text(text: str):
+    """
+    پارس کردن چند محصول از متن چند‌خطی.
+    هر خط: نام/تعداد/قیمت  یا  نام، تعداد، قیمت
+    """
+    items = []
+    errors = []
+    for i, line in enumerate(text.strip().split("\n"), 1):
+        line = line.strip()
+        if not line:
+            continue
+        normalized = line.replace("،", "/").replace(",", "/")
+        parts = [p.strip() for p in normalized.split("/")]
+        if len(parts) != 3:
+            errors.append(f"خط {i}: «{line}» (باید ۳ بخش داشته باشه)")
+            continue
+        product, qty_str, amount_str = parts
+        try:
+            qty = int(qty_str.replace(" ", ""))
+            amount = float(amount_str.replace(" ", ""))
+            if qty <= 0 or amount < 0 or not product:
+                raise ValueError
+            items.append((product, qty, amount))
+        except ValueError:
+            errors.append(f"خط {i}: «{line}» (تعداد یا قیمت نامعتبر)")
+    return items, errors
+
+def format_number(n):
+    return f"{n:,.0f}"
+
+def order_total(items):
+    return sum(a * q for (_, q, a) in items)
+
+# ===== هندلرها =====
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     name = update.effective_user.first_name
     await update.message.reply_text(
         f"سلام {name}! 👋\n\n"
-        "به ربات حسابداری فروشت خوش اومدی 📦💰\n\n"
-        "⚡️ ثبت سریع: کافیه این‌جوری بنویسی:\n"
-        "نام محصول/تعداد/قیمت واحد\n"
-        "مثال: دستمال مرطوب/۲/۱۵۰۰۰۰\n\n"
+        "📦 برای ثبت فروش، هر محصول رو تو یه خط بنویس:\n"
+        "نام محصول/تعداد/قیمت واحد\n\n"
+        "مثال (یک محصول):\n"
+        "تراول ماگ دیلر/۱/۱۵۰۰۰۰\n\n"
+        "مثال (چند محصول):\n"
+        "تراول ماگ دیلر/۱/۱۵۰۰۰۰\n"
+        "ماگ سرامیکی/۲/۹۰۰۰۰\n\n"
         "یا از منوی پایین استفاده کن:",
         reply_markup=main_keyboard()
     )
-
-# ===== ثبت سریع فروش با پیام تکی =====
-def try_parse_quick_sale(text: str):
-    """تلاش برای پارس کردن پیام به فرم: نام/تعداد/قیمت (یا با کاما)"""
-    # هم / و هم ، و , به‌عنوان جداکننده پذیرفته می‌شه
-    normalized = text.replace("،", "/").replace(",", "/")
-    parts = [p.strip() for p in normalized.split("/")]
-    if len(parts) != 3:
-        return None
-    product, qty_str, amount_str = parts
-    try:
-        qty = int(qty_str.replace(" ", ""))
-        amount = float(amount_str.replace(" ", "").replace(",", ""))
-        if qty <= 0 or amount < 0 or not product:
-            return None
-        return product, qty, amount
-    except ValueError:
-        return None
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text
     user_id = update.effective_user.id
 
-    # اگه منتظر مقدار جدید برای ویرایش هستیم
-    if context.user_data.get('awaiting_edit_value'):
-        await process_edit_value(update, context)
+    # --- منتظر توضیحات سفارش ---
+    if context.user_data.get('awaiting_note'):
+        await process_note(update, context)
         return ConversationHandler.END
 
-    # اگه منتظر آدرس سفارش (فلوی سریع فروش+آدرس) هستیم
+    # --- منتظر آدرس فاکتور ---
     if context.user_data.get('awaiting_order_address'):
         await process_order_address(update, context)
         return ConversationHandler.END
 
-    # اگه منتظر اسم مشتری برای نام‌گذاری فایل هستیم
+    # --- منتظر اسم مشتری ---
     if context.user_data.get('awaiting_customer_name'):
-        await process_customer_name_for_filename(update, context)
+        await process_customer_name(update, context)
         return ConversationHandler.END
 
+    # --- دکمه‌های منو ---
     if text == "➕ ثبت فروش":
         await update.message.reply_text(
-            "📦 فروش رو این‌جوری بفرست:\n"
-            "نام محصول/تعداد/قیمت واحد\n\n"
-            "مثال:\nدستمال مرطوب/۲/۱۵۰۰۰۰\n\n"
-            "(برای لغو /cancel رو بزن)"
+            "📦 محصولات رو بفرست (هر خط یه محصول):\n"
+            "نام/تعداد/قیمت\n\n"
+            "مثال:\n"
+            "تراول ماگ دیلر/۱/۱۵۰۰۰۰\n"
+            "ماگ سرامیکی/۲/۹۰۰۰۰\n\n"
+            "(برای لغو /cancel بزن)"
         )
-        return WAITING_QUICK_SALE
+        return WAITING_ITEMS
 
-    elif text == "✏️ ویرایش/حذف فروش":
-        await send_delete_menu(update, context)
+    elif text == "✏️ ویرایش/حذف":
+        await send_edit_menu(update, context)
 
-    elif text == "📥 خروجی اکسل ماه":
-        await send_excel_export(update, context)
+    elif text == "💰 امروز":
+        await send_today_report(update, context)
 
     elif text == "📊 گزارش هفتگی":
         await send_weekly_report(update, context)
@@ -253,510 +324,430 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif text == "🏆 برترین محصولات":
         await send_top_products(update, context)
 
-    elif text == "📋 آخرین فروش‌ها":
-        await send_recent_sales(update, context)
+    elif text == "📋 آخرین سفارشات":
+        await send_recent_orders(update, context)
 
-    elif text == "💰 امروز":
-        await send_today_report(update, context)
-
-    elif text == "🏷 ساخت فاکتور پستی":
+    elif text == "🏷 فاکتور پستی":
         await update.message.reply_text(
-            "🏷 مشخصات گیرنده رو بفرست (هر چی هست، همونجوری پیست کن - نام، آدرس، تلفن، کدپستی):\n\n"
-            "بعدش محصولات و روش ارسال رو می‌پرسم.\n\n"
-            "(برای لغو /cancel رو بزن)"
+            "📮 مشخصات گیرنده رو بفرست (هر چی هست، همونجوری پیست کن):\n\n"
+            "(برای لغو /cancel بزن)"
         )
+        context.user_data['awaiting_order_address'] = True
         context.user_data['standalone_label'] = True
-        return WAITING_LABEL_INFO
+
+    elif text == "📥 خروجی اکسل":
+        await send_excel_export(update, context)
+
+    elif text == "📦 وضعیت سفارشات":
+        await send_status_overview(update, context)
 
     else:
-        # تلاش برای ثبت سریع فروش بدون نیاز به دکمه
-        parsed = try_parse_quick_sale(text)
-        if parsed:
-            product, qty, amount = parsed
-            sale_id = add_sale(product, amount, qty, user_id)
-            total = amount * qty
-            context.user_data['last_order'] = {
-                'sale_id': sale_id, 'product': product, 'qty': qty, 'amount': amount
-            }
-            keyboard = [[
-                InlineKeyboardButton("🏷 بله، آدرس رو می‌فرستم", callback_data="addaddr_yes"),
-                InlineKeyboardButton("❌ نه، فقط ثبت فروش", callback_data="addaddr_no"),
-            ]]
-            await update.message.reply_text(
-                f"✅ فروش ثبت شد!\n\n"
-                f"📦 محصول: {product}\n"
-                f"💵 قیمت واحد: {amount:,.0f} تومان\n"
-                f"🔢 تعداد: {qty}\n"
-                f"💰 جمع کل: {total:,.0f} تومان\n"
-                f"🕐 زمان: {datetime.now().strftime('%H:%M - %Y/%m/%d')}\n\n"
-                f"📮 می‌خوای فاکتور پستی هم براش بسازم؟",
-                reply_markup=InlineKeyboardMarkup(keyboard)
-            )
+        # ثبت سریع بدون دکمه
+        items, errors = parse_items_text(text)
+        if items and not errors:
+            await quick_register(update, context, items)
+        # اگه نه، نادیده بگیر
 
     return ConversationHandler.END
 
-async def get_quick_sale(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = update.message.text
-    user_id = update.effective_user.id
-    parsed = try_parse_quick_sale(text)
+async def get_items(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """دریافت آیتم‌ها از ConversationHandler state"""
+    items, errors = parse_items_text(update.message.text)
 
-    if not parsed:
-        await update.message.reply_text(
-            "❌ فرمت درست نیست. دوباره امتحان کن:\n"
-            "نام محصول/تعداد/قیمت واحد\n"
-            "مثال: دستمال مرطوب/۲/۱۵۰۰۰۰"
-        )
-        return WAITING_QUICK_SALE
+    if errors:
+        msg = "❌ برخی خطوط نامعتبر بودن:\n" + "\n".join(errors)
+        msg += "\n\nدوباره امتحان کن یا /cancel بزن."
+        await update.message.reply_text(msg)
+        return WAITING_ITEMS
 
-    product, qty, amount = parsed
-    sale_id = add_sale(product, amount, qty, user_id)
-    total = amount * qty
-    context.user_data['last_order'] = {
-        'sale_id': sale_id, 'product': product, 'qty': qty, 'amount': amount
-    }
-    keyboard = [[
-        InlineKeyboardButton("🏷 بله، آدرس رو می‌فرستم", callback_data="addaddr_yes"),
-        InlineKeyboardButton("❌ نه، فقط ثبت فروش", callback_data="addaddr_no"),
-    ]]
+    if not items:
+        await update.message.reply_text("❌ هیچ محصولی پارس نشد. دوباره امتحان کن.")
+        return WAITING_ITEMS
+
+    context.user_data['pending_items'] = items
+    total = order_total(items)
+
+    summary = "\n".join(f"• {p} × {q} = {format_number(a*q)} ت" for p, q, a in items)
     await update.message.reply_text(
-        f"✅ فروش ثبت شد!\n\n"
-        f"📦 محصول: {product}\n"
-        f"💵 قیمت واحد: {amount:,.0f} تومان\n"
-        f"🔢 تعداد: {qty}\n"
-        f"💰 جمع کل: {total:,.0f} تومان\n"
-        f"🕐 زمان: {datetime.now().strftime('%H:%M - %Y/%m/%d')}\n\n"
-        f"📮 می‌خوای فاکتور پستی هم براش بسازم؟",
+        f"✅ {len(items)} محصول ثبت شد:\n{summary}\n"
+        f"💰 جمع: {format_number(total)} تومان\n\n"
+        "📝 توضیحات سفارش داری؟ (مثل: کادو شود، رنگ مشکی)\n"
+        "اگه نداری، بنویس **ندارم** یا /skip"
+    )
+    context.user_data['awaiting_note'] = True
+    return ConversationHandler.END
+
+async def quick_register(update: Update, context: ContextTypes.DEFAULT_TYPE, items: list):
+    """ثبت سریع بدون دکمه"""
+    context.user_data['pending_items'] = items
+    total = order_total(items)
+    summary = "\n".join(f"• {p} × {q} = {format_number(a*q)} ت" for p, q, a in items)
+    await update.message.reply_text(
+        f"✅ {len(items)} محصول ثبت شد:\n{summary}\n"
+        f"💰 جمع: {format_number(total)} تومان\n\n"
+        "📝 توضیحات سفارش؟ (یا /skip)"
+    )
+    context.user_data['awaiting_note'] = True
+
+async def process_note(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = update.message.text.strip()
+    user_id = update.effective_user.id
+    items = context.user_data.get('pending_items', [])
+
+    if not items:
+        await update.message.reply_text("❌ سفارشی پیدا نشد.", reply_markup=main_keyboard())
+        context.user_data.clear()
+        return
+
+    note = "" if text in ["/skip", "ندارم", "-"] else text
+    order_id = create_order(user_id, items, note)
+    total = order_total(items)
+    summary = "\n".join(f"• {p} × {q} = {format_number(a*q)} ت" for p, q, a in items)
+
+    context.user_data.pop('awaiting_note', None)
+    context.user_data.pop('pending_items', None)
+    context.user_data['last_order_id'] = order_id
+
+    keyboard = [[
+        InlineKeyboardButton("🏷 بله، آدرس می‌فرستم", callback_data=f"addaddr_yes_{order_id}"),
+        InlineKeyboardButton("❌ نه", callback_data="addaddr_no"),
+    ]]
+    note_line = f"📝 {note}\n" if note else ""
+    await update.message.reply_text(
+        f"🎉 سفارش #{order_id} ثبت شد!\n\n"
+        f"{summary}\n"
+        f"💰 جمع: {format_number(total)} تومان\n"
+        f"{note_line}"
+        f"🟡 وضعیت: ثبت شده\n\n"
+        "📮 آدرس پستی هم می‌خوای ثبت کنی؟",
         reply_markup=InlineKeyboardMarkup(keyboard)
     )
-    return ConversationHandler.END
 
 async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data.clear()
     await update.message.reply_text("❌ لغو شد.", reply_markup=main_keyboard())
     return ConversationHandler.END
 
-# ===== ویرایش / حذف فروش =====
-async def send_delete_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+# ===== ویرایش / حذف / وضعیت =====
+async def send_edit_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     end = datetime.now()
     start = end - timedelta(days=30)
-
-    sales = get_sales_in_range(user_id,
+    orders_data = get_orders_in_range(user_id,
         start.strftime("%Y-%m-%d 00:00:00"),
         end.strftime("%Y-%m-%d 23:59:59")
-    )[:15]
+    )[:10]
 
-    if not sales:
-        await update.message.reply_text("📭 فروشی برای ویرایش یا حذف وجود نداره.")
+    if not orders_data:
+        await update.message.reply_text("📭 سفارشی برای ویرایش وجود نداره.")
         return
 
-    for sale_id, prod, amt, qty, date in sales:
-        d = date.split(" ")[0][5:]  # ماه-روز
+    for (oid, note, status, date), items in orders_data:
+        d = date.split(" ")[0][5:]
+        total = sum(a * q for _, q, a in items)
+        products_str = "، ".join(f"{p}×{q}" for p, q, a in items[:2])
+        if len(items) > 2:
+            products_str += f" (+{len(items)-2})"
         keyboard = [[
-            InlineKeyboardButton("✏️ ویرایش", callback_data=f"edit_{sale_id}"),
-            InlineKeyboardButton("🗑 حذف", callback_data=f"del_{sale_id}")
+            InlineKeyboardButton("🔄 وضعیت", callback_data=f"setstatus_{oid}"),
+            InlineKeyboardButton("📝 توضیحات", callback_data=f"editnote_{oid}"),
+            InlineKeyboardButton("🗑 حذف", callback_data=f"del_{oid}"),
         ]]
         await update.message.reply_text(
-            f"📦 {prod} × {qty} | 💰 {format_number(amt*qty)}ت | 📅 {d}",
+            f"#{oid} | {d} | {status}\n{products_str}\n💰 {format_number(total)} ت",
             reply_markup=InlineKeyboardMarkup(keyboard)
         )
 
-async def handle_delete_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def handle_callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
     user_id = update.effective_user.id
+    data = query.data
 
-    if query.data == "addaddr_yes":
+    # --- آدرس پستی ---
+    if data.startswith("addaddr_yes_"):
+        order_id = int(data.split("_")[2])
+        context.user_data['label_order_id'] = order_id
         await query.edit_message_text(
-            "📮 مشخصات گیرنده رو بفرست (هر چی هست، همونجوری پیست کن):\n\n"
-            "(برای لغو /cancel رو بزن)"
+            "📮 مشخصات گیرنده رو بفرست (همونجوری پیست کن):\n(برای لغو /cancel)"
         )
         context.user_data['awaiting_order_address'] = True
-        return
 
-    elif query.data == "addaddr_no":
-        await query.edit_message_text("✅ باشه، فقط فروش ثبت موند.")
-        context.user_data.pop('last_order', None)
-        return
+    elif data == "addaddr_no":
+        context.user_data.pop('last_order_id', None)
+        await query.edit_message_text("✅ باشه، سفارش ثبت موند.")
 
-    elif query.data.startswith("shipvia_"):
-        method = query.data.split("_")[1]
+    # --- وضعیت سفارش ---
+    elif data.startswith("setstatus_"):
+        order_id = int(data.split("_")[1])
+        keyboard = [[InlineKeyboardButton(s, callback_data=f"dostatus_{order_id}_{i}")]
+                    for i, s in enumerate(ALL_STATUSES)]
+        await query.edit_message_text("🔄 وضعیت جدید رو انتخاب کن:", reply_markup=InlineKeyboardMarkup(keyboard))
+
+    elif data.startswith("dostatus_"):
+        _, order_id_str, idx_str = data.split("_")
+        order_id = int(order_id_str)
+        new_status = ALL_STATUSES[int(idx_str)]
+        update_order_status(order_id, user_id, new_status)
+        await query.edit_message_text(f"✅ وضعیت سفارش #{order_id} شد: {new_status}")
+
+    # --- ویرایش توضیحات ---
+    elif data.startswith("editnote_"):
+        order_id = int(data.split("_")[1])
+        context.user_data['editing_note_order_id'] = order_id
+        context.user_data['awaiting_note_edit'] = True
+        await query.edit_message_text(
+            f"📝 توضیحات جدید برای سفارش #{order_id} رو بفرست:\n(یا /skip برای پاک کردن)"
+        )
+
+    # --- حذف ---
+    elif data.startswith("del_"):
+        order_id = int(data.split("_")[1])
+        keyboard = [[
+            InlineKeyboardButton("✅ بله حذف کن", callback_data=f"confirmdel_{order_id}"),
+            InlineKeyboardButton("❌ لغو", callback_data="canceldel"),
+        ]]
+        order, items = get_order(order_id, user_id)
+        if order:
+            total = sum(a * q for _, _, q, a in items)
+            await query.edit_message_text(
+                f"⚠️ سفارش #{order_id} حذف بشه؟\n💰 {format_number(total)} تومان",
+                reply_markup=InlineKeyboardMarkup(keyboard)
+            )
+
+    elif data.startswith("confirmdel_"):
+        order_id = int(data.split("_")[1])
+        delete_order(order_id, user_id)
+        await query.edit_message_text(f"✅ سفارش #{order_id} حذف شد.")
+
+    elif data == "canceldel":
+        await query.edit_message_text("❌ حذف لغو شد.")
+
+    # --- روش ارسال ---
+    elif data.startswith("shipvia_"):
+        method = data.split("_")[1]
         method_names = {"tipax": "تیپاکس", "post": "پست", "chapar": "چاپار"}
         method_fa = method_names.get(method, method)
         order = context.user_data.get('pending_label_order')
-
         if not order:
-            await query.edit_message_text("❌ اطلاعات سفارش پیدا نشد، دوباره امتحان کن.")
+            await query.edit_message_text("❌ اطلاعات پیدا نشد.")
             return
-
         if method == "post":
-            # برای روش پست، اول باید نوع کرایه رو بپرسیم
             order['shipping_method'] = method_fa
             context.user_data['pending_label_order'] = order
             keyboard = [[
                 InlineKeyboardButton("💰 پیش‌کرایه", callback_data="postpay_pre"),
                 InlineKeyboardButton("💵 پس‌کرایه", callback_data="postpay_post"),
             ]]
-            await query.edit_message_text(
-                "📮 نوع کرایه پست چیه؟",
-                reply_markup=InlineKeyboardMarkup(keyboard)
-            )
+            await query.edit_message_text("📮 نوع کرایه پست چیه؟", reply_markup=InlineKeyboardMarkup(keyboard))
             return
+        await finalize_label(update, context, order, method_fa, user_id)
 
-        await finalize_and_send_label(update, context, order, method_fa, user_id)
-        return
-
-    elif query.data.startswith("postpay_"):
-        pay_type = query.data.split("_")[1]
-        pay_names = {"pre": "پیش‌کرایه", "post": "پس‌کرایه"}
-        pay_fa = pay_names.get(pay_type, "")
+    elif data.startswith("postpay_"):
+        pay_fa = "پیش‌کرایه" if data.split("_")[1] == "pre" else "پس‌کرایه"
         order = context.user_data.get('pending_label_order')
-
         if not order:
-            await query.edit_message_text("❌ اطلاعات سفارش پیدا نشد، دوباره امتحان کن.")
+            await query.edit_message_text("❌ اطلاعات پیدا نشد.")
             return
-
         method_fa = f"{order.get('shipping_method', 'پست')} ({pay_fa})"
-        await finalize_and_send_label(update, context, order, method_fa, user_id)
+        await finalize_label(update, context, order, method_fa, user_id)
+
+async def handle_note_edit(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """ویرایش توضیحات از منوی ویرایش"""
+    if not context.user_data.get('awaiting_note_edit'):
         return
-        return
-
-    if query.data.startswith("del_"):
-        sale_id = int(query.data.split("_")[1])
-        sale = get_sale_by_id(sale_id, user_id)
-        if not sale:
-            await query.edit_message_text("❌ این فروش پیدا نشد (شاید قبلاً حذف شده).")
-            return
-        keyboard = [[
-            InlineKeyboardButton("✅ بله، حذف کن", callback_data=f"confirmdel_{sale_id}"),
-            InlineKeyboardButton("❌ نه، بیخیال", callback_data="canceldel")
-        ]]
-        _, prod, amt, qty, date = sale
-        await query.edit_message_text(
-            f"⚠️ مطمئنی می‌خوای این فروش رو حذف کنی؟\n\n"
-            f"📦 {prod} × {qty}\n"
-            f"💰 {format_number(amt*qty)} تومان",
-            reply_markup=InlineKeyboardMarkup(keyboard)
-        )
-
-    elif query.data.startswith("confirmdel_"):
-        sale_id = int(query.data.split("_")[1])
-        deleted = delete_sale(sale_id, user_id)
-        if deleted:
-            await query.edit_message_text("✅ فروش حذف شد.")
-        else:
-            await query.edit_message_text("❌ خطا در حذف فروش.")
-
-    elif query.data == "canceldel":
-        await query.edit_message_text("❌ حذف لغو شد.")
-
-    elif query.data.startswith("edit_"):
-        sale_id = int(query.data.split("_")[1])
-        sale = get_sale_by_id(sale_id, user_id)
-        if not sale:
-            await query.edit_message_text("❌ این فروش پیدا نشد.")
-            return
-        context.user_data['edit_sale_id'] = sale_id
-        keyboard = [[
-            InlineKeyboardButton("📦 نام محصول", callback_data=f"editfield_product_{sale_id}"),
-            InlineKeyboardButton("🔢 تعداد", callback_data=f"editfield_quantity_{sale_id}"),
-        ], [
-            InlineKeyboardButton("💵 قیمت واحد", callback_data=f"editfield_amount_{sale_id}"),
-        ]]
-        _, prod, amt, qty, date = sale
-        await query.edit_message_text(
-            f"✏️ کدوم بخش رو می‌خوای ویرایش کنی؟\n\n"
-            f"📦 محصول: {prod}\n"
-            f"🔢 تعداد: {qty}\n"
-            f"💵 قیمت واحد: {format_number(amt)} تومان",
-            reply_markup=InlineKeyboardMarkup(keyboard)
-        )
-
-    elif query.data.startswith("editfield_"):
-        _, field, sale_id = query.data.split("_")
-        context.user_data['edit_sale_id'] = int(sale_id)
-        context.user_data['edit_field'] = field
-        field_names = {"product": "نام محصول", "quantity": "تعداد", "amount": "قیمت واحد"}
-        await query.edit_message_text(f"✏️ مقدار جدید برای «{field_names[field]}» رو بفرست:")
-        context.user_data['awaiting_edit_value'] = True
-
-async def finalize_and_send_label(update: Update, context: ContextTypes.DEFAULT_TYPE, order: dict, method_fa: str, user_id: int):
-    """ساخت نهایی فاکتور پستی و ارسال آن، با شماره سریال و نام مشتری در اسم فایل"""
-    query = update.callback_query
-    try:
-        pdf_path = create_shipping_label(
-            order['recipient_info'], order['products_line'], method_fa
-        )
-        serial = get_next_label_number(user_id)
-        customer_name = order.get('customer_name', '').strip()
-        safe_name = re.sub(r'[^\w\u0600-\u06FF]+', '_', customer_name).strip('_') if customer_name else "بدون_نام"
-        file_caption_name = f"فاکتور_{serial:03d}_{safe_name}.pdf"
-
-        with open(pdf_path, "rb") as f:
-            await context.bot.send_document(
-                chat_id=update.effective_chat.id,
-                document=f,
-                filename=file_caption_name,
-                caption=f"🏷 فاکتور پستی ({method_fa}) برای {customer_name or 'مشتری'} ساخته شد ✅\n📄 {file_caption_name}"
-            )
-        await query.edit_message_text(f"✅ روش ارسال: {method_fa} - فاکتور ({file_caption_name}) ارسال شد.")
-    except Exception as e:
-        await query.edit_message_text(f"❌ خطا در ساخت فاکتور: {e}")
-
-    context.user_data.pop('pending_label_order', None)
-
-async def process_edit_value(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = update.message.text.strip()
     user_id = update.effective_user.id
-    sale_id = context.user_data.get('edit_sale_id')
-    field = context.user_data.get('edit_field')
-    new_value_text = update.message.text.strip()
-
-    if not sale_id or not field:
-        await update.message.reply_text("❌ خطا، دوباره از منو امتحان کن.", reply_markup=main_keyboard())
-        context.user_data.clear()
+    order_id = context.user_data.pop('editing_note_order_id', None)
+    context.user_data.pop('awaiting_note_edit', None)
+    if not order_id:
         return
+    note = "" if text in ["/skip", "ندارم", "-"] else text
+    update_order_note(order_id, user_id, note)
+    await update.message.reply_text(f"✅ توضیحات سفارش #{order_id} آپدیت شد.", reply_markup=main_keyboard())
 
-    try:
-        if field == "quantity":
-            value = int(new_value_text)
-            if value <= 0:
-                raise ValueError
-        elif field == "amount":
-            value = float(new_value_text.replace(",", "").replace(" ", ""))
-            if value < 0:
-                raise ValueError
-        else:  # product
-            value = new_value_text
-            if not value:
-                raise ValueError
-
-        updated = update_sale(sale_id, user_id, field, value)
-        if updated:
-            sale = get_sale_by_id(sale_id, user_id)
-            _, prod, amt, qty, date = sale
-            await update.message.reply_text(
-                f"✅ ویرایش انجام شد!\n\n"
-                f"📦 محصول: {prod}\n"
-                f"🔢 تعداد: {qty}\n"
-                f"💵 قیمت واحد: {format_number(amt)} تومان\n"
-                f"💰 جمع: {format_number(amt*qty)} تومان",
-                reply_markup=main_keyboard()
-            )
-        else:
-            await update.message.reply_text("❌ خطا در ویرایش.", reply_markup=main_keyboard())
-
-    except ValueError:
-        await update.message.reply_text(
-            "❌ مقدار نامعتبره. دوباره امتحان کن یا دوباره از منوی ویرایش شروع کن.",
-            reply_markup=main_keyboard()
-        )
-
-    context.user_data.clear()
-
+# ===== فلوی فاکتور پستی =====
 async def process_order_address(update: Update, context: ContextTypes.DEFAULT_TYPE):
     address_text = update.message.text.strip()
-    order = context.user_data.get('last_order')
-
-    if not order:
-        await update.message.reply_text("❌ سفارشی پیدا نشد، دوباره از ثبت فروش شروع کن.", reply_markup=main_keyboard())
-        context.user_data.clear()
-        return
-
-    # کل متن پیست‌شده عیناً به‌عنوان «مشخصات گیرنده» استفاده می‌شه، بدون پردازش یا تفکیک
-    products_line = f"{order['product']}×{order['qty']}"
     context.user_data['pending_label_order'] = {
         'recipient_info': address_text,
-        'products_line': products_line,
+        'order_id': context.user_data.get('label_order_id'),
+        'standalone': context.user_data.get('standalone_label', False),
     }
     context.user_data.pop('awaiting_order_address', None)
-    context.user_data.pop('last_order', None)
+    context.user_data.pop('label_order_id', None)
+    context.user_data.pop('standalone_label', None)
     context.user_data['awaiting_customer_name'] = True
+    await update.message.reply_text("👤 اسم مشتری چی باشه؟ (برای نام‌گذاری فایل)")
 
-    await update.message.reply_text(
-        "👤 اسم مشتری چی باشه؟ (فقط برای نام‌گذاری فایل، مثلاً: علی محمدی)"
-    )
-
-async def process_customer_name_for_filename(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def process_customer_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
     customer_name = update.message.text.strip()
     order = context.user_data.get('pending_label_order')
-
     if not order:
-        await update.message.reply_text("❌ سفارشی پیدا نشد، دوباره از ثبت فروش شروع کن.", reply_markup=main_keyboard())
+        await update.message.reply_text("❌ سفارشی پیدا نشد.", reply_markup=main_keyboard())
         context.user_data.clear()
         return
-
     order['customer_name'] = customer_name
     context.user_data['pending_label_order'] = order
     context.user_data.pop('awaiting_customer_name', None)
-
     keyboard = [[
         InlineKeyboardButton("📦 تیپاکس", callback_data="shipvia_tipax"),
         InlineKeyboardButton("📮 پست", callback_data="shipvia_post"),
         InlineKeyboardButton("🚚 چاپار", callback_data="shipvia_chapar"),
     ]]
-    await update.message.reply_text(
-        "🚚 روش ارسال چیه؟",
-        reply_markup=InlineKeyboardMarkup(keyboard)
-    )
+    await update.message.reply_text("🚚 روش ارسال چیه؟", reply_markup=InlineKeyboardMarkup(keyboard))
+
+async def finalize_label(update, context, order: dict, method_fa: str, user_id: int):
+    query = update.callback_query
+    order_id = order.get('order_id')
+    items_for_label = []
+
+    if order_id:
+        _, db_items = get_order(order_id, user_id)
+        items_for_label = [(p, q, a) for _, p, q, a in db_items]
+
+    try:
+        note = ""
+        if order_id:
+            db_order, _ = get_order(order_id, user_id)
+            if db_order:
+                note = db_order[1]
+
+        pdf_path = create_shipping_label(
+            order['recipient_info'],
+            items_for_label,
+            method_fa,
+            note
+        )
+        serial = get_next_label_number(user_id)
+        customer_name = order.get('customer_name', '').strip()
+        safe_name = re.sub(r'[^\w\u0600-\u06FF]+', '_', customer_name).strip('_') or "بدون_نام"
+        file_name = f"فاکتور_{serial:03d}_{safe_name}.pdf"
+
+        with open(pdf_path, "rb") as f:
+            await context.bot.send_document(
+                chat_id=update.effective_chat.id,
+                document=f,
+                filename=file_name,
+                caption=f"🏷 فاکتور ({method_fa}) | {customer_name}\n📄 {file_name}"
+            )
+        await query.edit_message_text(f"✅ فاکتور {file_name} ارسال شد.")
+    except Exception as e:
+        await query.edit_message_text(f"❌ خطا: {e}")
+
+    context.user_data.pop('pending_label_order', None)
 
 # ===== گزارش‌ها =====
-def format_number(n):
-    return f"{n:,.0f}"
-
 async def send_today_report(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     today = datetime.now().strftime("%Y-%m-%d")
-    start = today + " 00:00:00"
-    end = today + " 23:59:59"
-
-    sales = get_sales_in_range(user_id, start, end)
-
-    if not sales:
-        await update.message.reply_text("📭 امروز هیچ فروشی ثبت نشده.")
+    orders_data = get_orders_in_range(user_id, today + " 00:00:00", today + " 23:59:59")
+    if not orders_data:
+        await update.message.reply_text("📭 امروز هیچ سفارشی ثبت نشده.")
         return
-
-    total = sum(s[2] * s[3] for s in sales)
-    count = sum(s[3] for s in sales)
-
-    text = f"☀️ گزارش امروز - {today}\n"
-    text += "━━━━━━━━━━━━━━━━\n"
-
-    for sid, p, a, q, d in sales:
-        time = d.split(" ")[1][:5]
-        text += f"🕐 {time} | {p} × {q} = {format_number(a*q)} ت\n"
-
-    text += "━━━━━━━━━━━━━━━━\n"
-    text += f"🛒 تعداد آیتم: {count}\n"
-    text += f"💰 جمع کل: {format_number(total)} تومان"
-
+    total = sum(order_total(items) for _, items in orders_data)
+    total_items = sum(sum(q for _, q, _ in items) for _, items in orders_data)
+    text = f"☀️ گزارش امروز\n━━━━━━━━━━━━━━━\n"
+    for (oid, note, status, date), items in orders_data:
+        t = date.split(" ")[1][:5]
+        text += f"🕐 {t} | #{oid} | {status}\n"
+        for p, q, a in items:
+            text += f"   • {p} × {q} = {format_number(a*q)} ت\n"
+    text += f"━━━━━━━━━━━━━━━\n🛒 {len(orders_data)} سفارش | {total_items} آیتم\n💰 {format_number(total)} تومان"
     await update.message.reply_text(text)
 
 async def send_weekly_report(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     end = datetime.now()
     start = end - timedelta(days=7)
-
-    sales = get_sales_in_range(user_id,
-        start.strftime("%Y-%m-%d 00:00:00"),
-        end.strftime("%Y-%m-%d 23:59:59")
-    )
-    products = get_product_summary(user_id,
-        start.strftime("%Y-%m-%d 00:00:00"),
-        end.strftime("%Y-%m-%d 23:59:59")
-    )
-
-    if not sales:
-        await update.message.reply_text("📭 در هفته گذشته هیچ فروشی ثبت نشده.")
+    orders_data = get_orders_in_range(user_id, start.strftime("%Y-%m-%d 00:00:00"), end.strftime("%Y-%m-%d 23:59:59"))
+    if not orders_data:
+        await update.message.reply_text("📭 در هفته گذشته سفارشی ثبت نشده.")
         return
-
-    total = sum(s[2] * s[3] for s in sales)
-    total_items = sum(s[3] for s in sales)
-
-    text = f"📊 گزارش هفتگی\n"
-    text += f"📅 {start.strftime('%Y/%m/%d')} تا {end.strftime('%Y/%m/%d')}\n"
-    text += "━━━━━━━━━━━━━━━━\n"
-    text += f"🛒 کل فروش: {len(sales)} سفارش ({total_items} آیتم)\n"
+    total = sum(order_total(items) for _, items in orders_data)
+    total_items = sum(sum(q for _, q, _ in items) for _, items in orders_data)
+    text = f"📊 گزارش هفتگی\n{start.strftime('%Y/%m/%d')} تا {end.strftime('%Y/%m/%d')}\n━━━━━━━━━━━━━━━\n"
+    text += f"🛒 {len(orders_data)} سفارش | {total_items} آیتم\n"
     text += f"💰 درآمد کل: {format_number(total)} تومان\n"
     text += f"📌 میانگین روزانه: {format_number(total/7)} تومان\n"
-    text += "\n🏆 فروش محصولات:\n"
-
-    for i, (prod, tot, qty) in enumerate(products[:5], 1):
-        text += f"{i}. {prod}: {qty} عدد = {format_number(tot)} ت\n"
-
+    products = get_product_summary(user_id, start.strftime("%Y-%m-%d 00:00:00"), end.strftime("%Y-%m-%d 23:59:59"))
+    if products:
+        text += "\n🏆 برترین محصولات:\n"
+        for i, (p, tot, qty) in enumerate(products[:5], 1):
+            text += f"{i}. {p}: {qty} عدد | {format_number(tot)} ت\n"
     await update.message.reply_text(text)
 
 async def send_monthly_report(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     now = datetime.now()
     start = now.replace(day=1, hour=0, minute=0, second=0)
-
-    sales = get_sales_in_range(user_id,
-        start.strftime("%Y-%m-%d 00:00:00"),
-        now.strftime("%Y-%m-%d 23:59:59")
-    )
-    products = get_product_summary(user_id,
-        start.strftime("%Y-%m-%d 00:00:00"),
-        now.strftime("%Y-%m-%d 23:59:59")
-    )
-
-    if not sales:
-        await update.message.reply_text("📭 این ماه هیچ فروشی ثبت نشده.")
+    orders_data = get_orders_in_range(user_id, start.strftime("%Y-%m-%d 00:00:00"), now.strftime("%Y-%m-%d 23:59:59"))
+    if not orders_data:
+        await update.message.reply_text("📭 این ماه سفارشی ثبت نشده.")
         return
-
-    total = sum(s[2] * s[3] for s in sales)
-    total_items = sum(s[3] for s in sales)
-    days_passed = (now - start).days + 1
-
-    text = f"📈 گزارش ماهانه\n"
-    text += f"📅 {start.strftime('%Y/%m')} | {days_passed} روز گذشته\n"
-    text += "━━━━━━━━━━━━━━━━\n"
-    text += f"🛒 کل سفارشات: {len(sales)} ({total_items} آیتم)\n"
+    total = sum(order_total(items) for _, items in orders_data)
+    total_items = sum(sum(q for _, q, _ in items) for _, items in orders_data)
+    days = (now - start).days + 1
+    profit = total * PROFIT_MARGIN
+    text = f"📈 گزارش ماهانه | {start.strftime('%Y/%m')}\n━━━━━━━━━━━━━━━\n"
+    text += f"🛒 {len(orders_data)} سفارش | {total_items} آیتم\n"
     text += f"💰 درآمد کل: {format_number(total)} تومان\n"
-    text += f"📌 میانگین روزانه: {format_number(total/days_passed)} تومان\n"
-    text += f"📆 پیش‌بینی ماهانه: {format_number(total/days_passed*30)} تومان\n"
-    estimated_profit = total * PROFIT_MARGIN
-    text += f"💵 سود تقریبی (۳۰٪): {format_number(estimated_profit)} تومان\n"
-    text += "\n🏆 برترین محصولات ماه:\n"
-
-    for i, (prod, tot, qty) in enumerate(products, 1):
-        pct = (tot / total * 100) if total else 0
-        text += f"{i}. {prod}\n   {qty} عدد | {format_number(tot)} ت ({pct:.0f}%)\n"
-
+    text += f"📌 میانگین روزانه: {format_number(total/days)} تومان\n"
+    text += f"📆 پیش‌بینی ماه: {format_number(total/days*30)} تومان\n"
+    text += f"💵 سود تقریبی (۳۰٪): {format_number(profit)} تومان\n"
+    products = get_product_summary(user_id, start.strftime("%Y-%m-%d 00:00:00"), now.strftime("%Y-%m-%d 23:59:59"))
+    if products:
+        text += "\n🏆 برترین محصولات:\n"
+        for i, (p, tot, qty) in enumerate(products, 1):
+            pct = tot / total * 100 if total else 0
+            text += f"{i}. {p}: {qty} عدد | {format_number(tot)} ت ({pct:.0f}%)\n"
     await update.message.reply_text(text)
 
 async def send_top_products(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     end = datetime.now()
     start = end - timedelta(days=30)
-
-    products = get_product_summary(user_id,
-        start.strftime("%Y-%m-%d 00:00:00"),
-        end.strftime("%Y-%m-%d 23:59:59")
-    )
-
+    products = get_product_summary(user_id, start.strftime("%Y-%m-%d 00:00:00"), end.strftime("%Y-%m-%d 23:59:59"))
     if not products:
         await update.message.reply_text("📭 داده‌ای برای نمایش وجود نداره.")
         return
-
-    total_all = sum(p[1] for p in products)
-
+    total_all = sum(t for _, t, _ in products)
     medals = ["🥇", "🥈", "🥉", "4️⃣", "5️⃣"]
-    text = "🏆 برترین محصولات (۳۰ روز اخیر)\n"
-    text += "━━━━━━━━━━━━━━━━\n"
-
-    for i, (prod, tot, qty) in enumerate(products):
+    text = "🏆 برترین محصولات (۳۰ روز اخیر)\n━━━━━━━━━━━━━━━\n"
+    for i, (p, tot, qty) in enumerate(products):
         medal = medals[i] if i < len(medals) else f"{i+1}."
-        pct = (tot / total_all * 100) if total_all else 0
+        pct = tot / total_all * 100 if total_all else 0
         bar = "█" * int(pct / 10) + "░" * (10 - int(pct / 10))
-        text += f"{medal} {prod}\n"
-        text += f"   {bar} {pct:.0f}%\n"
-        text += f"   {qty} عدد | {format_number(tot)} تومان\n\n"
-
+        text += f"{medal} {p}\n   {bar} {pct:.0f}%\n   {qty} عدد | {format_number(tot)} ت\n\n"
     await update.message.reply_text(text)
 
-async def send_recent_sales(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def send_recent_orders(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     end = datetime.now()
     start = end - timedelta(days=30)
-
-    sales = get_sales_in_range(user_id,
-        start.strftime("%Y-%m-%d 00:00:00"),
-        end.strftime("%Y-%m-%d 23:59:59")
-    )[:10]
-
-    if not sales:
-        await update.message.reply_text("📭 فروشی ثبت نشده.")
+    orders_data = get_orders_in_range(user_id, start.strftime("%Y-%m-%d 00:00:00"), end.strftime("%Y-%m-%d 23:59:59"))[:10]
+    if not orders_data:
+        await update.message.reply_text("📭 سفارشی ثبت نشده.")
         return
-
-    text = "📋 آخرین ۱۰ فروش\n"
-    text += "━━━━━━━━━━━━━━━━\n"
-
-    for sid, prod, amt, qty, date in sales:
+    text = "📋 آخرین سفارشات\n━━━━━━━━━━━━━━━\n"
+    for (oid, note, status, date), items in orders_data:
         d = date.split(" ")[0]
         t = date.split(" ")[1][:5]
-        text += f"📦 {prod} × {qty}\n"
-        text += f"   💵 {format_number(amt*qty)} ت | 📅 {d} {t}\n\n"
+        total = order_total(items)
+        text += f"#{oid} | {d} {t} | {status}\n"
+        for p, q, a in items:
+            text += f"   • {p} × {q} = {format_number(a*q)} ت\n"
+        if note:
+            text += f"   📝 {note}\n"
+        text += f"   💰 جمع: {format_number(total)} ت\n\n"
+    await update.message.reply_text(text)
 
+async def send_status_overview(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    counts = get_status_counts(user_id)
+    text = "📦 وضعیت سفارشات\n━━━━━━━━━━━━━━━\n"
+    for status, count in counts.items():
+        text += f"{status}: {count} سفارش\n"
     await update.message.reply_text(text)
 
 # ===== خروجی اکسل =====
@@ -764,193 +755,142 @@ async def send_excel_export(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     now = datetime.now()
     start = now.replace(day=1, hour=0, minute=0, second=0)
-
-    sales = get_sales_in_range(user_id,
-        start.strftime("%Y-%m-%d 00:00:00"),
-        now.strftime("%Y-%m-%d 23:59:59")
-    )
-
-    if not sales:
-        await update.message.reply_text("📭 این ماه فروشی برای خروجی گرفتن وجود نداره.")
+    orders_data = get_orders_in_range(user_id, start.strftime("%Y-%m-%d 00:00:00"), now.strftime("%Y-%m-%d 23:59:59"))
+    if not orders_data:
+        await update.message.reply_text("📭 این ماه سفارشی برای خروجی گرفتن وجود نداره.")
         return
 
     wb = Workbook()
     ws = wb.active
-    ws.title = "فروش ماه"
+    ws.title = "سفارشات ماه"
     ws.sheet_view.rightToLeft = True
 
-    headers = ["تاریخ", "نام محصول", "تعداد", "قیمت واحد", "مبلغ کل"]
+    headers = ["شماره سفارش", "تاریخ", "نام محصول", "تعداد", "قیمت واحد", "مبلغ کل", "توضیحات", "وضعیت"]
     ws.append(headers)
     for cell in ws[1]:
         cell.font = Font(bold=True)
         cell.alignment = Alignment(horizontal="center")
 
     total_all = 0
-    for sale_id, prod, amt, qty, date in sorted(sales, key=lambda s: s[4]):
+    for (oid, note, status, date), items in sorted(orders_data, key=lambda x: x[0][3]):
         d = date.split(" ")[0]
-        row_total = amt * qty
-        total_all += row_total
-        ws.append([d, prod, qty, amt, row_total])
+        for p, q, a in items:
+            row_total = a * q
+            total_all += row_total
+            ws.append([oid, d, p, q, a, row_total, note, status])
 
-    ws.append(["", "", "", "جمع کل", total_all])
-    last_row = ws.max_row
-    ws[f"D{last_row}"].font = Font(bold=True)
-    ws[f"E{last_row}"].font = Font(bold=True)
+    ws.append(["", "", "", "", "", total_all, "", ""])
+    last = ws.max_row
+    ws[f"F{last}"].font = Font(bold=True)
 
-    for col in ["A", "B", "C", "D", "E"]:
-        ws.column_dimensions[col].width = 18
+    for col in ["A", "B", "C", "D", "E", "F", "G", "H"]:
+        ws.column_dimensions[col].width = 16
 
-    filename = f"/tmp/sales_{now.strftime('%Y_%m')}.xlsx"
+    filename = f"/tmp/orders_{now.strftime('%Y_%m')}.xlsx"
     wb.save(filename)
-
     with open(filename, "rb") as f:
         await update.message.reply_document(
             document=f,
-            filename=f"فروش_{now.strftime('%Y_%m')}.xlsx",
-            caption=f"📥 خروجی اکسل فروش‌های {start.strftime('%Y/%m')} ✅"
+            filename=f"سفارشات_{now.strftime('%Y_%m')}.xlsx",
+            caption=f"📥 خروجی اکسل {start.strftime('%Y/%m')} ✅"
         )
 
-
-async def get_label_info(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = update.message.text.strip()
-
-    if context.user_data.get('standalone_label'):
-        # مرحله ۱: مشخصات گیرنده دریافت شد، حالا محصولات رو بپرس
-        context.user_data['standalone_recipient'] = text
-        context.user_data.pop('standalone_label', None)
-        context.user_data['standalone_awaiting_products'] = True
-        await update.message.reply_text(
-            "📦 حالا محصولات سفارش رو بفرست (مثال: تراول ماگ×۱, دستمال مرطوب×۲):"
-        )
-        return WAITING_LABEL_INFO
-
-    if context.user_data.get('standalone_awaiting_products'):
-        products_line = text
-        recipient_info = context.user_data.pop('standalone_recipient', "")
-        context.user_data.pop('standalone_awaiting_products', None)
-        context.user_data['pending_label_order'] = {
-            'recipient_info': recipient_info,
-            'products_line': products_line,
-        }
-        context.user_data['awaiting_customer_name'] = True
-        await update.message.reply_text(
-            "👤 اسم مشتری چی باشه؟ (فقط برای نام‌گذاری فایل، مثلاً: علی محمدی)"
-        )
-        return ConversationHandler.END
-
-    return ConversationHandler.END
-
-def create_shipping_label(recipient_info, products_line, shipping_method=""):
+# ===== فاکتور PDF =====
+def create_shipping_label(recipient_info: str, items: list, shipping_method: str = "", note: str = ""):
     register_persian_font()
     use_font = FONT_NAME if FONT_REGISTERED else "Helvetica"
-
     filename = f"/tmp/label_{datetime.now().strftime('%Y%m%d%H%M%S')}.pdf"
     width, height = A5
     c = canvas.Canvas(filename, pagesize=A5)
-
     margin = 10 * mm
     y = height - margin
 
-    def draw_rtl_line(text_str, font_size, y_pos):
+    def draw_rtl(text_str, font_size, y_pos):
         c.setFont(use_font, font_size)
-        display_text = fa(text_str) if FONT_REGISTERED else text_str
-        c.drawRightString(width - margin, y_pos, display_text)
+        display = fa(text_str) if FONT_REGISTERED else text_str
+        c.drawRightString(width - margin, y_pos, display)
 
-    def wrap_text(text_str, max_chars):
-        lines = []
-        words = text_str.split(" ")
-        current_line = ""
-        for word in words:
-            test_line = (current_line + " " + word).strip()
-            if len(test_line) > max_chars:
-                if current_line:
-                    lines.append(current_line)
-                current_line = word
-            else:
-                current_line = test_line
-        if current_line:
-            lines.append(current_line)
-        return lines
+    def wrap_rtl(text_str, max_chars, font_size, start_y):
+        cur_y = start_y
+        for raw_line in text_str.split("\n"):
+            raw_line = raw_line.strip()
+            if not raw_line:
+                continue
+            words = raw_line.split(" ")
+            current = ""
+            for word in words:
+                test = (current + " " + word).strip()
+                if len(test) > max_chars:
+                    if current:
+                        draw_rtl(current, font_size, cur_y)
+                        cur_y -= 6 * mm
+                    current = word
+                else:
+                    current = test
+            if current:
+                draw_rtl(current, font_size, cur_y)
+                cur_y -= 6 * mm
+        return cur_y
 
-    # کادر دور برگه
-    c.setLineWidth(1.2)
-    c.rect(4*mm, 4*mm, width - 8*mm, height - 8*mm)
+    # کادر
+    c.setLineWidth(1.5)
+    c.rect(5*mm, 5*mm, width - 10*mm, height - 10*mm)
 
-    # لوگوی فروشگاه - گوشه سمت راست بالا
-    logo_size = 16 * mm
+    # لوگو
+    logo_size = 18 * mm
     if os.path.exists(LOGO_PATH):
         try:
             logo = ImageReader(LOGO_PATH)
-            c.drawImage(
-                logo,
-                width - margin - logo_size,
-                height - margin - logo_size + 2*mm,
-                width=logo_size,
-                height=logo_size,
-                preserveAspectRatio=True,
-                mask='auto'
-            )
+            c.drawImage(logo, width - margin - logo_size, height - margin - logo_size,
+                        width=logo_size, height=logo_size, preserveAspectRatio=True, mask='auto')
         except Exception:
             pass
 
-    # عنوان (پایین‌تر از لوگو، وسط‌چین)
-    y -= (logo_size - 2*mm)
-    c.setFont(use_font, 13)
-    title_text = fa("فاکتور ارسال مرسوله") if FONT_REGISTERED else "فاکتور ارسال مرسوله"
-    c.drawCentredString(width / 2, y, title_text)
-    y -= 6*mm
+    # عنوان
+    y -= (logo_size + 3*mm)
+    c.setFont(use_font, 15)
+    title = fa("فاکتور ارسال مرسوله") if FONT_REGISTERED else "فاکتور ارسال مرسوله"
+    c.drawCentredString(width / 2, y, title)
+    if shipping_method:
+        y -= 6*mm
+        c.setFont(use_font, 10)
+        m = fa(f"روش ارسال: {shipping_method}") if FONT_REGISTERED else f"روش ارسال: {shipping_method}"
+        c.drawCentredString(width / 2, y, m)
+    y -= 7*mm
 
     c.setLineWidth(0.5)
     c.line(margin, y, width - margin, y)
-    y -= 6*mm
+    y -= 7*mm
 
-    # ===== بخش فرستنده (ثابت) =====
-    draw_rtl_line("فرستنده:", 10.5, y)
-    y -= 5.5*mm
-    draw_rtl_line(f"{STORE_NAME} | {STORE_PHONE}", 9.5, y)
-    y -= 5*mm
-    for line in wrap_text(STORE_ADDRESS, 42):
-        draw_rtl_line(line, 9, y)
-        y -= 4.8*mm
-
-    y -= 1.5*mm
-    c.line(margin, y, width - margin, y)
-    y -= 6*mm
-
-    # ===== بخش گیرنده (مشتری) =====
-    header = "گیرنده:"
-    if shipping_method:
-        header_full = f"گیرنده:        روش ارسال: {shipping_method}"
-        draw_rtl_line(header_full, 10.5, y)
-    else:
-        draw_rtl_line(header, 10.5, y)
-    y -= 6*mm
-
-    for raw_line in recipient_info.split("\n"):
-        raw_line = raw_line.strip()
-        if not raw_line:
-            continue
-        for line in wrap_text(raw_line, 40):
-            draw_rtl_line(line, 11, y)
-            y -= 6*mm
-
+    # فرستنده
+    draw_rtl("فرستنده:", 11, y); y -= 6*mm
+    draw_rtl(STORE_NAME, 11, y); y -= 6*mm
+    y = wrap_rtl(STORE_ADDRESS, 42, 9, y)
+    draw_rtl(f"تلفن: {STORE_PHONE}", 9, y); y -= 6*mm
     y -= 2*mm
     c.line(margin, y, width - margin, y)
-    y -= 6*mm
+    y -= 7*mm
 
-    # محصولات سفارش
-    draw_rtl_line("اقلام سفارش:", 10.5, y)
-    y -= 6*mm
+    # گیرنده
+    draw_rtl("گیرنده:", 11, y); y -= 6*mm
+    y = wrap_rtl(recipient_info, 42, 10, y)
+    y -= 2*mm
+    c.line(margin, y, width - margin, y)
+    y -= 7*mm
 
-    items = [p.strip() for p in products_line.split(",")]
-    for item in items:
-        draw_rtl_line(f"• {item}", 10, y)
-        y -= 5.5*mm
+    # اقلام
+    draw_rtl("اقلام سفارش:", 11, y); y -= 6*mm
+    if items:
+        for p, q, a in items:
+            draw_rtl(f"• {p} × {q}  =  {format_number(a*q)} ت", 10, y); y -= 6*mm
+        total = sum(a * q for _, q, a in items)
+        draw_rtl(f"جمع کل: {format_number(total)} تومان", 10, y); y -= 6*mm
+    if note:
+        y -= 2*mm
+        draw_rtl(f"📝 {note}", 9, y); y -= 5*mm
 
-    # پاورقی
-    c.setFont("Helvetica", 7)
-    c.drawCentredString(width / 2, 8*mm, datetime.now().strftime("%Y-%m-%d %H:%M"))
-
+    c.setFont("Helvetica", 8)
+    c.drawCentredString(width / 2, 10*mm, datetime.now().strftime("%Y-%m-%d %H:%M"))
     c.save()
     return filename
 
@@ -960,20 +900,24 @@ def main():
     register_persian_font()
     app = Application.builder().token(BOT_TOKEN).build()
 
-    conv_handler = ConversationHandler(
+    conv = ConversationHandler(
         entry_points=[MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message)],
         states={
-            WAITING_QUICK_SALE: [MessageHandler(filters.TEXT & ~filters.COMMAND, get_quick_sale)],
-            WAITING_LABEL_INFO: [MessageHandler(filters.TEXT & ~filters.COMMAND, get_label_info)],
+            WAITING_ITEMS: [MessageHandler(filters.TEXT & ~filters.COMMAND, get_items)],
         },
-        fallbacks=[CommandHandler("cancel", cancel)],
+        fallbacks=[CommandHandler("cancel", cancel), CommandHandler("skip", cancel)],
     )
 
     app.add_handler(CommandHandler("start", start))
-    app.add_handler(conv_handler)
-    app.add_handler(CallbackQueryHandler(handle_delete_callback))
+    app.add_handler(CommandHandler("skip", lambda u, c: process_note(u, c)))
+    app.add_handler(conv)
+    app.add_handler(CallbackQueryHandler(handle_callbacks))
+    app.add_handler(MessageHandler(
+        filters.TEXT & ~filters.COMMAND,
+        lambda u, c: handle_note_edit(u, c) if c.user_data.get('awaiting_note_edit') else None
+    ))
 
-    print("✅ ربات حسابداری شروع به کار کرد...")
+    print("✅ ربات هاگ ماگ نسخه ۳ شروع به کار کرد...")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 if __name__ == "__main__":
