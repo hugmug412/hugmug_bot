@@ -7,6 +7,7 @@
 import os
 import re
 import sqlite3
+import jdatetime
 from datetime import datetime, timedelta
 from telegram import (
     Update, ReplyKeyboardMarkup, KeyboardButton,
@@ -87,14 +88,14 @@ def init_db():
             status TEXT DEFAULT "🟡 ثبت شده",
             date TEXT NOT NULL,
             user_id INTEGER NOT NULL,
-            recipient_info TEXT DEFAULT "",
-            customer_name TEXT DEFAULT ""
+            customer_name TEXT DEFAULT "",
+            label_number INTEGER DEFAULT 0
         )
     ''')
-    # اضافه کردن ستون‌های جدید در صورت نبودن
-    for col, coldef in [("recipient_info", "TEXT DEFAULT ''"), ("customer_name", "TEXT DEFAULT ''")]:
+    # اضافه کردن ستون‌های جدید به جداول قدیمی (برای upgrade بدون از دست دادن داده)
+    for col in [("customer_name", "TEXT DEFAULT ''"), ("label_number", "INTEGER DEFAULT 0")]:
         try:
-            c.execute(f"ALTER TABLE orders ADD COLUMN {col} {coldef}")
+            conn.execute(f"ALTER TABLE orders ADD COLUMN {col[0]} {col[1]}")
         except Exception:
             pass
     # جدول اقلام هر سفارش
@@ -118,13 +119,13 @@ def init_db():
     conn.commit()
     conn.close()
 
-def create_order(user_id: int, items: list, note: str = "", recipient_info: str = "", customer_name: str = "") -> int:
+def create_order(user_id: int, items: list, note: str = "") -> int:
     """ثبت سفارش جدید با چند آیتم. items = [(product, qty, amount), ...]"""
     conn = sqlite3.connect(DB_FILE)
     c = conn.cursor()
     c.execute(
-        "INSERT INTO orders (note, status, date, user_id, recipient_info, customer_name) VALUES (?, ?, ?, ?, ?, ?)",
-        (note, STATUS_NEW, datetime.now().strftime("%Y-%m-%d %H:%M:%S"), user_id, recipient_info, customer_name)
+        "INSERT INTO orders (note, status, date, user_id, customer_name, label_number) VALUES (?, ?, ?, ?, ?, ?)",
+        (note, STATUS_NEW, datetime.now().strftime("%Y-%m-%d %H:%M:%S"), user_id, "", 0)
     )
     order_id = c.lastrowid
     for product, qty, amount in items:
@@ -136,10 +137,23 @@ def create_order(user_id: int, items: list, note: str = "", recipient_info: str 
     conn.close()
     return order_id
 
+def save_order_label_info(order_id: int, user_id: int, customer_name: str, label_number: int):
+    """ذخیره نام مشتری و شماره فاکتور روی سفارش"""
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    c.execute(
+        "UPDATE orders SET customer_name=?, label_number=? WHERE id=? AND user_id=?",
+        (customer_name, label_number, order_id, user_id)
+    )
+    conn.commit()
+    conn.close()
+    conn.close()
+    return order_id
+
 def get_order(order_id: int, user_id: int):
     conn = sqlite3.connect(DB_FILE)
     c = conn.cursor()
-    c.execute("SELECT id, note, status, date FROM orders WHERE id=? AND user_id=?", (order_id, user_id))
+    c.execute("SELECT id, note, status, date, customer_name, label_number FROM orders WHERE id=? AND user_id=?", (order_id, user_id))
     order = c.fetchone()
     if not order:
         conn.close()
@@ -153,7 +167,7 @@ def get_orders_in_range(user_id: int, start: str, end: str):
     conn = sqlite3.connect(DB_FILE)
     c = conn.cursor()
     c.execute(
-        "SELECT id, note, status, date FROM orders WHERE user_id=? AND date BETWEEN ? AND ? ORDER BY date DESC",
+        "SELECT id, note, status, date, customer_name, label_number FROM orders WHERE user_id=? AND date BETWEEN ? AND ? ORDER BY date DESC",
         (user_id, start, end)
     )
     orders = c.fetchall()
@@ -270,6 +284,47 @@ def format_number(n):
 def order_total(items):
     return sum(a * q for (_, q, a) in items)
 
+# ===== تاریخ شمسی =====
+def to_jalali(value, fmt="%Y/%m/%d"):
+    """
+    تبدیل تاریخ میلادی به شمسی برای نمایش.
+    value می‌تونه datetime باشه یا رشته‌ی ذخیره‌شده در دیتابیس ('YYYY-MM-DD HH:MM:SS' یا 'YYYY-MM-DD').
+    """
+    if isinstance(value, str):
+        v = value.split(".")[0].strip()
+        if " " in v:
+            value = datetime.strptime(v, "%Y-%m-%d %H:%M:%S")
+        else:
+            value = datetime.strptime(v, "%Y-%m-%d")
+    j = jdatetime.datetime.fromgregorian(datetime=value)
+    return j.strftime(fmt)
+
+def get_jalali_month_bounds(offset: int = 0):
+    """
+    محدوده‌ی یک ماه شمسی رو برمی‌گردونه.
+    offset=0 یعنی ماه جاری، offset=1 یعنی یک ماه قبل، offset=2 دو ماه قبل و ...
+    خروجی: (start_datetime, end_datetime, برچسب 'YYYY/MM')
+    """
+    today_j = jdatetime.date.today()
+    total = today_j.year * 12 + (today_j.month - 1) - offset
+    y, m0 = divmod(total, 12)
+    m = m0 + 1
+    start_j = jdatetime.date(y, m, 1)
+    if m == 12:
+        next_start_j = jdatetime.date(y + 1, 1, 1)
+    else:
+        next_start_j = jdatetime.date(y, m + 1, 1)
+    end_j = next_start_j - timedelta(days=1)
+
+    start_g = datetime.combine(start_j.togregorian(), datetime.min.time())
+    if offset == 0:
+        end_g = datetime.now()
+    else:
+        end_g = datetime.combine(end_j.togregorian(), datetime.max.time())
+
+    label = start_j.strftime("%Y/%m")
+    return start_g, end_g, label
+
 # ===== هندلرها =====
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     name = update.effective_user.first_name
@@ -372,84 +427,34 @@ async def get_items(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("❌ هیچ محصولی پارس نشد. دوباره امتحان کن.")
         return WAITING_ITEMS
 
-    context.user_data['pending_items'] = items
-    total = order_total(items)
-
-    summary = "\n".join(f"• {p} × {q} = {format_number(a*q)} ت" for p, q, a in items)
-    await update.message.reply_text(
-        f"✅ {len(items)} محصول ثبت شد:\n{summary}\n"
-        f"💰 جمع: {format_number(total)} تومان\n\n"
-        "📮 آدرس پستی گیرنده رو بفرست:\n"
-        "(اگه آدرس نداری، بنویس **ندارم** یا /skip)"
-    )
-    context.user_data['awaiting_order_address'] = True
-    context.user_data['standalone_label'] = False
+    await register_and_ask_address(update, context, items)
     return ConversationHandler.END
 
 async def quick_register(update: Update, context: ContextTypes.DEFAULT_TYPE, items: list):
     """ثبت سریع بدون دکمه"""
-    context.user_data['pending_items'] = items
-    total = order_total(items)
-    summary = "\n".join(f"• {p} × {q} = {format_number(a*q)} ت" for p, q, a in items)
-    await update.message.reply_text(
-        f"✅ {len(items)} محصول ثبت شد:\n{summary}\n"
-        f"💰 جمع: {format_number(total)} تومان\n\n"
-        "📮 آدرس پستی گیرنده رو بفرست:\n"
-        "(اگه آدرس نداری، بنویس **ندارم** یا /skip)"
-    )
-    context.user_data['awaiting_order_address'] = True
-    context.user_data['standalone_label'] = False
+    await register_and_ask_address(update, context, items)
 
-async def process_note(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = update.message.text.strip()
+async def register_and_ask_address(update: Update, context: ContextTypes.DEFAULT_TYPE, items: list):
+    """ثبت سفارش (بدون توضیحات فعلاً) و پرسیدن آدرس"""
     user_id = update.effective_user.id
-    items = context.user_data.get('pending_items', [])
-
-    if not items:
-        await update.message.reply_text("❌ سفارشی پیدا نشد.", reply_markup=main_keyboard())
-        context.user_data.clear()
-        return
-
-    note = "" if text in ["/skip", "ندارم", "-"] else text
-    order_id = create_order(user_id, items, note)
+    order_id = create_order(user_id, items, note="")
     total = order_total(items)
-    summary = "\n".join(f"• {p} × {q} = {format_number(a*q)} ت" for p, q, a in items)
+    summary = "\n".join(f"• {p} × {q}" for p, q, a in items)
 
-    context.user_data.pop('awaiting_note', None)
-    context.user_data.pop('pending_items', None)
     context.user_data['last_order_id'] = order_id
 
-    note_line = f"📝 {note}\n" if note else ""
-
-    # اگه قبلاً آدرس داشتیم، order_id رو ست کن و برو سراغ اسم مشتری
-    pending_label = context.user_data.get('pending_label_order')
-    if pending_label and pending_label.get('has_address'):
-        pending_label['order_id'] = order_id
-        context.user_data['pending_label_order'] = pending_label
-        await update.message.reply_text(
-            f"🎉 سفارش #{order_id} ثبت شد!\n\n"
-            f"{summary}\n"
-            f"💰 جمع: {format_number(total)} تومان\n"
-            f"{note_line}"
-            f"🟡 وضعیت: ثبت شده\n\n"
-            "👤 اسم مشتری چی باشه؟ (برای نام‌گذاری فایل)"
-        )
-        context.user_data['awaiting_customer_name'] = True
-    else:
-        # بدون آدرس — مثل قبل دکمه نمایش بده
-        keyboard = [[
-            InlineKeyboardButton("🏷 بله، آدرس می‌فرستم", callback_data=f"addaddr_yes_{order_id}"),
-            InlineKeyboardButton("❌ نه", callback_data="addaddr_no"),
-        ]]
-        await update.message.reply_text(
-            f"🎉 سفارش #{order_id} ثبت شد!\n\n"
-            f"{summary}\n"
-            f"💰 جمع: {format_number(total)} تومان\n"
-            f"{note_line}"
-            f"🟡 وضعیت: ثبت شده\n\n"
-            "📮 آدرس پستی هم می‌خوای ثبت کنی؟",
-            reply_markup=InlineKeyboardMarkup(keyboard)
-        )
+    keyboard = [[
+        InlineKeyboardButton("🏷 بله، آدرس می‌فرستم", callback_data=f"addaddr_yes_{order_id}"),
+        InlineKeyboardButton("❌ نه", callback_data="addaddr_no"),
+    ]]
+    await update.message.reply_text(
+        f"🎉 سفارش #{order_id} ثبت شد!\n\n"
+        f"{summary}\n"
+        f"💰 جمع: {format_number(total)} تومان\n"
+        f"🟡 وضعیت: ثبت شده\n\n"
+        "📮 آدرس پستی هم می‌خوای ثبت کنی؟",
+        reply_markup=InlineKeyboardMarkup(keyboard)
+    )
 
 async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data.clear()
@@ -470,8 +475,8 @@ async def send_edit_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("📭 سفارشی برای ویرایش وجود نداره.")
         return
 
-    for (oid, note, status, date), items in orders_data:
-        d = date.split(" ")[0][5:]
+    for (oid, note, status, date, customer_name, label_num), items in orders_data:
+        d = to_jalali(date, "%m/%d")
         total = sum(a * q for _, q, a in items)
         products_str = "، ".join(f"{p}×{q}" for p, q, a in items[:2])
         if len(items) > 2:
@@ -580,6 +585,16 @@ async def handle_callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
         method_fa = f"{order.get('shipping_method', 'پست')} ({pay_fa})"
         await finalize_label(update, context, order, method_fa, user_id)
 
+    # --- ناوبری گزارش ماهانه ---
+    elif data.startswith("monthrep_"):
+        offset = int(data.split("_")[1])
+        await send_monthly_report(update, context, offset=offset, edit=True)
+
+    # --- ناوبری خروجی اکسل ---
+    elif data.startswith("excelrep_"):
+        offset = int(data.split("_")[1])
+        await send_excel_export(update, context, offset=offset, from_callback=True)
+
 async def handle_note_edit(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """ویرایش توضیحات از منوی ویرایش"""
     if not context.user_data.get('awaiting_note_edit'):
@@ -597,29 +612,16 @@ async def handle_note_edit(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ===== فلوی فاکتور پستی =====
 async def process_order_address(update: Update, context: ContextTypes.DEFAULT_TYPE):
     address_text = update.message.text.strip()
-    is_standalone = context.user_data.get('standalone_label', False)
-    no_address = address_text in ["/skip", "ندارم", "-"]
-
     context.user_data['pending_label_order'] = {
-        'recipient_info': "" if no_address else address_text,
+        'recipient_info': address_text,
         'order_id': context.user_data.get('label_order_id'),
-        'standalone': is_standalone,
-        'has_address': not no_address,
+        'standalone': context.user_data.get('standalone_label', False),
     }
     context.user_data.pop('awaiting_order_address', None)
     context.user_data.pop('label_order_id', None)
     context.user_data.pop('standalone_label', None)
-
-    # اگه ثبت فروش جدید بود (pending_items داریم) → بعد از آدرس توضیحات بگیر
-    if context.user_data.get('pending_items') and not is_standalone:
-        context.user_data['awaiting_note'] = True
-        await update.message.reply_text(
-            "📝 توضیحات سفارش داری؟ (مثل: کادو شود، رنگ مشکی)\n"
-            "اگه نداری، بنویس **ندارم** یا /skip"
-        )
-    else:
-        context.user_data['awaiting_customer_name'] = True
-        await update.message.reply_text("👤 اسم مشتری چی باشه؟ (برای نام‌گذاری فایل)")
+    context.user_data['awaiting_customer_name'] = True
+    await update.message.reply_text("👤 اسم مشتری چی باشه؟ (برای نام‌گذاری فایل)")
 
 async def process_customer_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
     customer_name = update.message.text.strip()
@@ -631,6 +633,34 @@ async def process_customer_name(update: Update, context: ContextTypes.DEFAULT_TY
     order['customer_name'] = customer_name
     context.user_data['pending_label_order'] = order
     context.user_data.pop('awaiting_customer_name', None)
+    # بعد از اسم مشتری، توضیحات سفارش رو بپرس
+    context.user_data['awaiting_note'] = True
+    await update.message.reply_text(
+        "📝 توضیحات سفارش داری؟ (مثل: کادو شود، رنگ مشکی)\n"
+        "اگه نداری بنویس /skip"
+    )
+
+async def process_note(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """توضیحات بعد از آدرس و نام مشتری — ذخیره میشه و بعد روش ارسال پرسیده می‌شه"""
+    text = update.message.text.strip()
+    user_id = update.effective_user.id
+    order = context.user_data.get('pending_label_order')
+
+    if not order:
+        await update.message.reply_text("❌ سفارشی پیدا نشد.", reply_markup=main_keyboard())
+        context.user_data.clear()
+        return
+
+    note = "" if text in ["/skip", "ندارم", "-"] else text
+    order['note'] = note
+    context.user_data['pending_label_order'] = order
+    context.user_data.pop('awaiting_note', None)
+
+    # ذخیره توضیحات روی سفارش در دیتابیس
+    order_id = order.get('order_id')
+    if order_id and note:
+        update_order_note(order_id, user_id, note)
+
     keyboard = [[
         InlineKeyboardButton("📦 تیپاکس", callback_data="shipvia_tipax"),
         InlineKeyboardButton("📮 پست", callback_data="shipvia_post"),
@@ -642,19 +672,21 @@ async def finalize_label(update, context, order: dict, method_fa: str, user_id: 
     query = update.callback_query
     order_id = order.get('order_id')
     items_for_label = []
+    note = ""
 
     if order_id:
-        _, db_items = get_order(order_id, user_id)
+        db_order, db_items = get_order(order_id, user_id)
         items_for_label = [(p, q, a) for _, p, q, a in db_items]
+        if db_order:
+            note = db_order[1]  # note field
 
     try:
-        note = ""
-        order_status = STATUS_NEW
+        serial = get_next_label_number(user_id)
+        customer_name = order.get('customer_name', '').strip()
+
+        # ذخیره نام مشتری و شماره فاکتور روی سفارش
         if order_id:
-            db_order, _ = get_order(order_id, user_id)
-            if db_order:
-                note = db_order[1]
-                order_status = db_order[2]
+            save_order_label_info(order_id, user_id, customer_name, serial)
 
         pdf_path = create_shipping_label(
             order['recipient_info'],
@@ -662,10 +694,8 @@ async def finalize_label(update, context, order: dict, method_fa: str, user_id: 
             method_fa,
             note,
             order_id=order_id,
-            order_status=order_status
+            label_number=serial
         )
-        serial = get_next_label_number(user_id)
-        customer_name = order.get('customer_name', '').strip()
         safe_name = re.sub(r'[^\w\u0600-\u06FF]+', '_', customer_name).strip('_') or "بدون_نام"
         file_name = f"فاکتور_{serial:03d}_{safe_name}.pdf"
 
@@ -693,7 +723,7 @@ async def send_today_report(update: Update, context: ContextTypes.DEFAULT_TYPE):
     total = sum(order_total(items) for _, items in orders_data)
     total_items = sum(sum(q for _, q, _ in items) for _, items in orders_data)
     text = f"☀️ گزارش امروز\n━━━━━━━━━━━━━━━\n"
-    for (oid, note, status, date), items in orders_data:
+    for (oid, note, status, date, customer_name, label_num), items in orders_data:
         t = date.split(" ")[1][:5]
         text += f"🕐 {t} | #{oid} | {status}\n"
         for p, q, a in items:
@@ -711,7 +741,7 @@ async def send_weekly_report(update: Update, context: ContextTypes.DEFAULT_TYPE)
         return
     total = sum(order_total(items) for _, items in orders_data)
     total_items = sum(sum(q for _, q, _ in items) for _, items in orders_data)
-    text = f"📊 گزارش هفتگی\n{start.strftime('%Y/%m/%d')} تا {end.strftime('%Y/%m/%d')}\n━━━━━━━━━━━━━━━\n"
+    text = f"📊 گزارش هفتگی\n{to_jalali(start)} تا {to_jalali(end)}\n━━━━━━━━━━━━━━━\n"
     text += f"🛒 {len(orders_data)} سفارش | {total_items} آیتم\n"
     text += f"💰 درآمد کل: {format_number(total)} تومان\n"
     text += f"📌 میانگین روزانه: {format_number(total/7)} تومان\n"
@@ -722,31 +752,46 @@ async def send_weekly_report(update: Update, context: ContextTypes.DEFAULT_TYPE)
             text += f"{i}. {p}: {qty} عدد | {format_number(tot)} ت\n"
     await update.message.reply_text(text)
 
-async def send_monthly_report(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def send_monthly_report(update: Update, context: ContextTypes.DEFAULT_TYPE, offset: int = 0, edit: bool = False):
     user_id = update.effective_user.id
-    now = datetime.now()
-    start = now.replace(day=1, hour=0, minute=0, second=0)
-    orders_data = get_orders_in_range(user_id, start.strftime("%Y-%m-%d 00:00:00"), now.strftime("%Y-%m-%d 23:59:59"))
+    start, end, label = get_jalali_month_bounds(offset)
+    orders_data = get_orders_in_range(user_id, start.strftime("%Y-%m-%d 00:00:00"), end.strftime("%Y-%m-%d 23:59:59"))
+
+    nav_row = [InlineKeyboardButton("◀️ ماه قبل", callback_data=f"monthrep_{offset+1}")]
+    if offset > 0:
+        nav_row.append(InlineKeyboardButton("ماه بعد ▶️", callback_data=f"monthrep_{offset-1}"))
+    reply_markup = InlineKeyboardMarkup([nav_row])
+
     if not orders_data:
-        await update.message.reply_text("📭 این ماه سفارشی ثبت نشده.")
+        text = f"📭 در {label} سفارشی ثبت نشده."
+        if edit:
+            await update.callback_query.edit_message_text(text, reply_markup=reply_markup)
+        else:
+            await update.message.reply_text(text, reply_markup=reply_markup)
         return
+
     total = sum(order_total(items) for _, items in orders_data)
     total_items = sum(sum(q for _, q, _ in items) for _, items in orders_data)
-    days = (now - start).days + 1
+    days = (end.date() - start.date()).days + 1
     profit = total * PROFIT_MARGIN
-    text = f"📈 گزارش ماهانه | {start.strftime('%Y/%m')}\n━━━━━━━━━━━━━━━\n"
+    text = f"📈 گزارش ماهانه | {label}\n━━━━━━━━━━━━━━━\n"
     text += f"🛒 {len(orders_data)} سفارش | {total_items} آیتم\n"
     text += f"💰 درآمد کل: {format_number(total)} تومان\n"
     text += f"📌 میانگین روزانه: {format_number(total/days)} تومان\n"
-    text += f"📆 پیش‌بینی ماه: {format_number(total/days*30)} تومان\n"
+    if offset == 0:
+        text += f"📆 پیش‌بینی ماه: {format_number(total/days*30)} تومان\n"
     text += f"💵 سود تقریبی (۳۰٪): {format_number(profit)} تومان\n"
-    products = get_product_summary(user_id, start.strftime("%Y-%m-%d 00:00:00"), now.strftime("%Y-%m-%d 23:59:59"))
+    products = get_product_summary(user_id, start.strftime("%Y-%m-%d 00:00:00"), end.strftime("%Y-%m-%d 23:59:59"))
     if products:
         text += "\n🏆 برترین محصولات:\n"
         for i, (p, tot, qty) in enumerate(products, 1):
             pct = tot / total * 100 if total else 0
             text += f"{i}. {p}: {qty} عدد | {format_number(tot)} ت ({pct:.0f}%)\n"
-    await update.message.reply_text(text)
+
+    if edit:
+        await update.callback_query.edit_message_text(text, reply_markup=reply_markup)
+    else:
+        await update.message.reply_text(text, reply_markup=reply_markup)
 
 async def send_top_products(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
@@ -775,8 +820,8 @@ async def send_recent_orders(update: Update, context: ContextTypes.DEFAULT_TYPE)
         await update.message.reply_text("📭 سفارشی ثبت نشده.")
         return
     text = "📋 آخرین سفارشات\n━━━━━━━━━━━━━━━\n"
-    for (oid, note, status, date), items in orders_data:
-        d = date.split(" ")[0]
+    for (oid, note, status, date, customer_name, label_num), items in orders_data:
+        d = to_jalali(date)
         t = date.split(" ")[1][:5]
         total = order_total(items)
         text += f"#{oid} | {d} {t} | {status}\n"
@@ -789,47 +834,59 @@ async def send_recent_orders(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
 async def send_status_overview(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
-    counts = get_status_counts(user_id)
-
-    # خلاصه وضعیت‌ها
-    text = "📦 وضعیت سفارشات\n━━━━━━━━━━━━━━━\n"
-    for status, count in counts.items():
-        text += f"{status}: {count} سفارش\n"
-
-    # لیست سفارشات ۳۰ روز اخیر با جزئیات
     end = datetime.now()
-    start = end - timedelta(days=30)
-    orders_data = get_orders_in_range(
-        user_id,
+    start = end - timedelta(days=60)
+    orders_data = get_orders_in_range(user_id,
         start.strftime("%Y-%m-%d 00:00:00"),
         end.strftime("%Y-%m-%d 23:59:59")
     )
 
-    if orders_data:
-        text += "\n━━━━━━━━━━━━━━━\n📋 جزئیات سفارشات (۳۰ روز اخیر):\n\n"
-        for (oid, note, status, date), items in orders_data:
-            d = date.split(" ")[0]
-            t = date.split(" ")[1][:5]
-            products_str = "، ".join(f"{p}×{q}" for p, q, a in items[:2])
-            if len(items) > 2:
-                products_str += f" (+{len(items)-2})"
-            text += f"#{oid} | {d} {t}\n"
-            text += f"   📦 {products_str}\n"
-            text += f"   {status}\n"
-            if note:
-                text += f"   📝 {note}\n"
-            text += "\n"
+    if not orders_data:
+        await update.message.reply_text("📭 سفارشی در ۶۰ روز اخیر وجود نداره.")
+        return
 
-    await update.message.reply_text(text)
+    # خلاصه وضعیت‌ها
+    counts = get_status_counts(user_id)
+    summary = "📦 وضعیت سفارشات\n━━━━━━━━━━━━━━━\n"
+    for status, count in counts.items():
+        summary += f"{status}: {count}\n"
+    await update.message.reply_text(summary)
+
+    # لیست سفارشات با دکمه تغییر وضعیت
+    for (oid, note, status, date, customer_name, label_num), items in orders_data:
+        d = to_jalali(date, "%m/%d")
+        products_str = "، ".join(f"{p}×{q}" for p, q, a in items[:2])
+        if len(items) > 2:
+            products_str += f" (+{len(items)-2})"
+
+        label_str = f"فاکتور_{label_num:03d}" if label_num else "بدون فاکتور"
+        name_str = customer_name if customer_name else "—"
+
+        keyboard = [[InlineKeyboardButton(s, callback_data=f"dostatus_{oid}_{i}")]
+                    for i, s in enumerate(ALL_STATUSES)]
+
+        await update.message.reply_text(
+            f"#{oid} | {label_str} | {name_str}\n"
+            f"📅 {d} | {status}\n"
+            f"🛍 {products_str}",
+            reply_markup=InlineKeyboardMarkup(keyboard)
+        )
 
 # ===== خروجی اکسل =====
-async def send_excel_export(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def send_excel_export(update: Update, context: ContextTypes.DEFAULT_TYPE, offset: int = 0, from_callback: bool = False):
     user_id = update.effective_user.id
-    now = datetime.now()
-    start = now.replace(day=1, hour=0, minute=0, second=0)
-    orders_data = get_orders_in_range(user_id, start.strftime("%Y-%m-%d 00:00:00"), now.strftime("%Y-%m-%d 23:59:59"))
+    start, end, label = get_jalali_month_bounds(offset)
+    orders_data = get_orders_in_range(user_id, start.strftime("%Y-%m-%d 00:00:00"), end.strftime("%Y-%m-%d 23:59:59"))
+
+    nav_row = [InlineKeyboardButton("◀️ ماه قبل", callback_data=f"excelrep_{offset+1}")]
+    if offset > 0:
+        nav_row.append(InlineKeyboardButton("ماه بعد ▶️", callback_data=f"excelrep_{offset-1}"))
+    reply_markup = InlineKeyboardMarkup([nav_row])
+
+    target = update.callback_query.message if from_callback else update.message
+
     if not orders_data:
-        await update.message.reply_text("📭 این ماه سفارشی برای خروجی گرفتن وجود نداره.")
+        await target.reply_text(f"📭 در {label} سفارشی برای خروجی گرفتن وجود نداره.", reply_markup=reply_markup)
         return
 
     wb = Workbook()
@@ -844,8 +901,8 @@ async def send_excel_export(update: Update, context: ContextTypes.DEFAULT_TYPE):
         cell.alignment = Alignment(horizontal="center")
 
     total_all = 0
-    for (oid, note, status, date), items in sorted(orders_data, key=lambda x: x[0][3]):
-        d = date.split(" ")[0]
+    for (oid, note, status, date, customer_name, label_num), items in sorted(orders_data, key=lambda x: x[0][3]):
+        d = to_jalali(date)
         for p, q, a in items:
             row_total = a * q
             total_all += row_total
@@ -858,17 +915,19 @@ async def send_excel_export(update: Update, context: ContextTypes.DEFAULT_TYPE):
     for col in ["A", "B", "C", "D", "E", "F", "G", "H"]:
         ws.column_dimensions[col].width = 16
 
-    filename = f"/tmp/orders_{now.strftime('%Y_%m')}.xlsx"
+    file_label = label.replace("/", "_")
+    filename = f"/tmp/orders_{file_label}.xlsx"
     wb.save(filename)
     with open(filename, "rb") as f:
-        await update.message.reply_document(
+        await target.reply_document(
             document=f,
-            filename=f"سفارشات_{now.strftime('%Y_%m')}.xlsx",
-            caption=f"📥 خروجی اکسل {start.strftime('%Y/%m')} ✅"
+            filename=f"سفارشات_{file_label}.xlsx",
+            caption=f"📥 خروجی اکسل {label} ✅",
+            reply_markup=reply_markup
         )
 
 # ===== فاکتور PDF =====
-def create_shipping_label(recipient_info: str, items: list, shipping_method: str = "", note: str = "", order_id: int = None, order_status: str = None):
+def create_shipping_label(recipient_info: str, items: list, shipping_method: str = "", note: str = "", order_id: int = 0, label_number: int = 0):
     register_persian_font()
     use_font = FONT_NAME if FONT_REGISTERED else "Helvetica"
     filename = f"/tmp/label_{datetime.now().strftime('%Y%m%d%H%M%S')}.pdf"
@@ -923,12 +982,23 @@ def create_shipping_label(recipient_info: str, items: list, shipping_method: str
     c.setFont(use_font, 15)
     title = fa("فاکتور ارسال مرسوله") if FONT_REGISTERED else "فاکتور ارسال مرسوله"
     c.drawCentredString(width / 2, y, title)
+    y -= 6*mm
+    c.setFont(use_font, 9)
+    ref_parts = []
+    if label_number:
+        ref_parts.append(f"فاکتور: {label_number:03d}")
+    if order_id:
+        ref_parts.append(f"سفارش: #{order_id}")
+    if ref_parts:
+        ref = fa("  |  ".join(ref_parts)) if FONT_REGISTERED else "  |  ".join(ref_parts)
+        c.drawCentredString(width / 2, y, ref)
+        y -= 5*mm
     if shipping_method:
-        y -= 6*mm
         c.setFont(use_font, 10)
         m = fa(f"روش ارسال: {shipping_method}") if FONT_REGISTERED else f"روش ارسال: {shipping_method}"
         c.drawCentredString(width / 2, y, m)
-    y -= 7*mm
+        y -= 5*mm
+    y -= 3*mm
 
     c.setLineWidth(0.5)
     c.line(margin, y, width - margin, y)
@@ -950,14 +1020,7 @@ def create_shipping_label(recipient_info: str, items: list, shipping_method: str
     c.line(margin, y, width - margin, y)
     y -= 7*mm
 
-    # شماره سفارش
-    if order_id:
-        y -= 2*mm
-        draw_rtl(f"شماره سفارش: #{order_id}", 10, y); y -= 7*mm
-        c.line(margin, y, width - margin, y)
-        y -= 7*mm
-
-    # اقلام سفارش (بدون مبلغ)
+    # اقلام (بدون مبلغ)
     draw_rtl("اقلام سفارش:", 11, y); y -= 6*mm
     if items:
         for p, q, a in items:
@@ -966,35 +1029,9 @@ def create_shipping_label(recipient_info: str, items: list, shipping_method: str
         y -= 2*mm
         draw_rtl(f"📝 {note}", 9, y); y -= 5*mm
 
-    # بخش وضعیت سفارش — سه فیلد
-    y -= 3*mm
-    c.line(margin, y, width - margin, y)
-    y -= 7*mm
-    draw_rtl("وضعیت سفارش:", 11, y); y -= 8*mm
-
-    box_w = (width - 2*margin - 4*mm) / 3
-    statuses = [
-        ("🟡 ثبت شده", STATUS_NEW),
-        ("📦 آماده ارسال", STATUS_READY),
-        ("🚚 ارسال شده", STATUS_SENT),
-    ]
-    for i, (label, val) in enumerate(statuses):
-        x_box = margin + i * (box_w + 2*mm)
-        # کادر
-        c.setLineWidth(1.2 if order_status == val else 0.5)
-        c.rect(x_box, y - 10*mm, box_w, 10*mm)
-        # تیک برای وضعیت فعلی
-        if order_status == val:
-            c.setFillColorRGB(0.9, 1.0, 0.9)
-            c.rect(x_box, y - 10*mm, box_w, 10*mm, fill=1, stroke=0)
-            c.setFillColorRGB(0, 0, 0)
-        c.setFont(use_font if FONT_REGISTERED else "Helvetica", 7)
-        display_label = fa(label) if FONT_REGISTERED else label
-        c.drawCentredString(x_box + box_w / 2, y - 7*mm, display_label)
-    y -= 14*mm
-
-    c.setFont("Helvetica", 8)
-    c.drawCentredString(width / 2, 10*mm, datetime.now().strftime("%Y-%m-%d %H:%M"))
+    c.setFont(use_font, 8)
+    footer_date = fa(to_jalali(datetime.now(), "%Y/%m/%d %H:%M")) if FONT_REGISTERED else to_jalali(datetime.now(), "%Y/%m/%d %H:%M")
+    c.drawCentredString(width / 2, 10*mm, footer_date)
     c.save()
     return filename
 
